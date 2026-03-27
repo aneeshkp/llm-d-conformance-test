@@ -88,7 +88,7 @@ make test-single TESTCASE=deepseek-r1-dp-ep-ht
 
 ```bash
 make test-by-label LABELS=cpu
-make test-by-label LABELS=gpu,rdma
+make test-by-label LABELS=gpu,deepseek
 make test-by-label LABELS=pd              # prefill/decode tests
 make test-by-label LABELS=smoke
 ```

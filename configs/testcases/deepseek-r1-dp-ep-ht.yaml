@@ -5,7 +5,6 @@ labels:
   - deepseek
   - moe
   - dp-ep
-  - rdma
   - multi-node
 model:
   name: deepseek-ai/DeepSeek-R1-0528

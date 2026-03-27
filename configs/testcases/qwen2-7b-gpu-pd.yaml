@@ -6,7 +6,6 @@ labels:
   - qwen2
   - prefill-decode
   - pd
-  - rdma
 model:
   name: Qwen/Qwen2.5-7B-Instruct
   uri: hf://Qwen/Qwen2.5-7B-Instruct

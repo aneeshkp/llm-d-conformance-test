@@ -21,7 +21,7 @@ The tests cover:
 - vLLM inference backend health and readiness
 - OpenAI-compatible API validation (`/health`, `/v1/models`, `/v1/chat/completions`)
 - EPP scheduler routing and KV cache-aware scheduling
-- Prefill/Decode disaggregation with RDMA-based KV transfer
+- Prefill/Decode disaggregation with KV cache transfer
 - Multi-node MoE inference with data/expert parallelism
 - Resource cleanup and redeployability
 
@@ -277,7 +277,7 @@ These tests deploy `Qwen/Qwen2.5-7B-Instruct` (~15GB), a production-quality 7B p
 
 #### TC-GPU-003: qwen2-7b-gpu-pd
 
-**Description:** Prefill/Decode disaggregation on GPU with RDMA-based KV cache transfer between prefill and decode pods.
+**Description:** Prefill/Decode disaggregation on GPU with KV cache transfer between prefill and decode pods via NixlConnector.
 
 | Field | Value |
 |-------|-------|
@@ -285,21 +285,23 @@ These tests deploy `Qwen/Qwen2.5-7B-Instruct` (~15GB), a production-quality 7B p
 | **Replicas** | 1 decode + 2 prefill |
 | **Scheduler** | EPP |
 | **GPUs** | 1 per pod (3 total) |
-| **RDMA** | Yes (`rdma/roce_gdr`, `roce-p2` network attachment) |
+| **Requires RDMA** | Yes (hardware prerequisite — validated by [rhaii-cluster-validation](https://github.com/opendatahub-io/rhaii-cluster-validation)) |
 | **Ready timeout** | 15 minutes |
-| **Labels** | `gpu`, `single-node-gpu`, `qwen2`, `prefill-decode`, `pd`, `rdma` |
-| **Environments** | PSAP IBM Cloud (RoCE), PSAP B200 (RoCE), CoreWeave (IB) |
+| **Labels** | `gpu`, `single-node-gpu`, `qwen2`, `prefill-decode`, `pd` |
+| **Environments** | PSAP IBM Cloud, PSAP B200, CoreWeave |
 
 **What it validates:**
-- RDMA network attachment annotation (`k8s.v1.cni.cncf.io/networks: roce-p2`)
-- NixlConnector for KV cache transfer: `--kv_transfer_config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'`
+- The `spec.prefill` CRD section creates a separate prefill pod pool on GPU
+- NixlConnector KV cache transfer between prefill and decode pods: `--kv_transfer_config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'`
 - `VLLM_NIXL_SIDE_CHANNEL_HOST` set to pod IP for KV transfer coordination
-- UCX transport configuration: `UCX_TLS=rc,sm,self,cuda_copy,cuda_ipc`
 - Prefill pod pool scales independently (2 replicas for higher prefill throughput)
-- Both pod pools (decode + prefill) become healthy and serve inference
+- Both pod pools (decode + prefill) become healthy and serve inference end-to-end
+
+**What it does NOT test:**
+- RDMA connectivity, SR-IOV, or network attachment — these are cluster prerequisites validated by [rhaii-cluster-validation](https://github.com/opendatahub-io/rhaii-cluster-validation)
 
 **Why it matters:**
-This is the high-performance production pattern. Prefill pods process prompts in parallel, then transfer the computed KV cache to decode pods over RDMA (bypassing CPU/network stack), avoiding re-computation. This significantly reduces time-to-first-token for long prompts.
+This is the high-performance production pattern. Prefill pods process prompts in parallel, then transfer the computed KV cache to decode pods, avoiding re-computation. This significantly reduces time-to-first-token for long prompts.
 
 **Test prompts:**
 1. "Explain prefill decode disaggregation."
@@ -383,7 +385,7 @@ These tests deploy large Mixture of Experts models that require multi-node GPU c
 
 #### TC-MOE-001: deepseek-r1-dp-ep-ht
 
-**Description:** DeepSeek-R1-0528 (671B MoE) with high-throughput DP/EP using RDMA/RoCE and DeepEP all-to-all backend.
+**Description:** DeepSeek-R1-0528 (671B MoE) with high-throughput DP/EP using DeepEP all-to-all backend.
 
 | Field | Value |
 |-------|-------|
@@ -391,12 +393,12 @@ These tests deploy large Mixture of Experts models that require multi-node GPU c
 | **Model source** | PVC (`pvc://llm-test-pvc-deepseek`) — must be pre-populated |
 | **Replicas** | 1 head + workers (via LeaderWorkerSet) |
 | **GPUs** | 8 per pod (`nvidia.com/gpu: 8`) |
-| **RDMA** | Yes (`rdma/roce_gdr: 1`, `k8s.v1.cni.cncf.io/networks: roce-p2`) |
+| **Requires RDMA** | Yes (hardware prerequisite — validated by [rhaii-cluster-validation](https://github.com/opendatahub-io/rhaii-cluster-validation)) |
 | **Parallelism** | data=32, dataLocal=8, expert=true, tensor=1 |
 | **All-to-all backend** | `deepep_high_throughput` |
 | **Ready timeout** | 90 minutes |
-| **Labels** | `gpu`, `deepseek`, `moe`, `dp-ep`, `rdma`, `multi-node` |
-| **Environments** | CoreWeave (IB), PSAP IBM Cloud (RoCE), PSAP B200 (RoCE) |
+| **Labels** | `gpu`, `deepseek`, `moe`, `dp-ep`, `multi-node` |
+| **Environments** | CoreWeave, PSAP IBM Cloud, PSAP B200 |
 
 **Resource requirements per pod:**
 
@@ -411,21 +413,16 @@ These tests deploy large Mixture of Experts models that require multi-node GPU c
 **What it validates:**
 - Multi-node MoE inference with expert parallelism (different experts on different GPUs)
 - LeaderWorkerSet (LWS) creates head + worker pod topology
-- NVSHMEM configuration for GPU-to-GPU RDMA:
-  - `NVSHMEM_REMOTE_TRANSPORT=ibgda` (InfiniBand GDR-Accelerated)
-  - `NVSHMEM_BOOTSTRAP_TWO_STAGE=1`
-  - `NVSHMEM_IBGDA_NIC_HANDLER=gpu`
-- NCCL configuration for inter-node communication:
-  - `NCCL_IB_GID_INDEX=3`
-  - `NCCL_SOCKET_IFNAME=net1`
-  - `NCCL_IB_TIMEOUT=100`
-- UCX transport: `UCX_TLS=rc,sm,self,cuda_copy,cuda_ipc`
-- GDRCopy enabled: `NVIDIA_GDRCOPY=enabled`
+- DeepEP high-throughput all-to-all backend (`VLLM_ALL2ALL_BACKEND=deepep_high_throughput`)
 - vLLM flags: `--gpu-memory-utilization 0.95 --max-model-len 8192 --enforce-eager`
 - Worker pods mirror the head pod configuration
+- Service becomes ready and serves inference end-to-end
+
+**What it does NOT test:**
+- RDMA connectivity, NVSHMEM transport, NCCL configuration, SR-IOV — these are cluster prerequisites validated by [rhaii-cluster-validation](https://github.com/opendatahub-io/rhaii-cluster-validation)
 
 **Why it matters:**
-This tests the most complex deployment pattern in LLM-D — a 671B parameter MoE model distributed across multiple 8-GPU nodes using expert parallelism. Different experts run on different GPUs across nodes and communicate via RDMA for the all-to-all dispatch/combine operations. This is the target deployment for production DeepSeek-R1 inference.
+This tests the most complex deployment pattern in LLM-D — a 671B parameter MoE model distributed across multiple 8-GPU nodes using expert parallelism. This is the target deployment for production DeepSeek-R1 inference.
 
 **Test prompts:**
 1. "What is expert parallelism in MoE models?"
@@ -434,7 +431,7 @@ This tests the most complex deployment pattern in LLM-D — a 671B parameter MoE
 
 #### TC-MOE-002: deepseek-coder-v2-dp-ep-naive
 
-**Description:** DeepSeek-Coder-V2-Lite with naive (TCP-based) all-to-all backend — validates DP/EP on clusters without RDMA networking.
+**Description:** DeepSeek-Coder-V2-Lite with naive (TCP-based) all-to-all backend — validates MoE DP/EP works on clusters without RDMA networking.
 
 | Field | Value |
 |-------|-------|
@@ -442,25 +439,21 @@ This tests the most complex deployment pattern in LLM-D — a 671B parameter MoE
 | **Model source** | HuggingFace (`hf://`) with PVC caching (200Gi) |
 | **Replicas** | 1 head + workers |
 | **GPUs** | 8 per pod |
-| **RDMA** | No (TCP via eth0/gVNIC) |
+| **Requires RDMA** | No (uses TCP) |
 | **Parallelism** | data=16, dataLocal=8, expert=true, tensor=1 |
 | **All-to-all backend** | `naive` (TCP-based) |
 | **Ready timeout** | 90 minutes |
 | **Labels** | `gpu`, `deepseek`, `moe`, `dp-ep`, `naive` |
-| **Environments** | CoreWeave, PSAP IBM Cloud, PSAP B200 |
+| **Environments** | All GPU environments (CoreWeave, AKS, PSAP IBM Cloud, PSAP B200) |
 
 **What it validates:**
-- MoE inference without RDMA hardware, using TCP-based communication:
-  - `NCCL_IB_DISABLE=1` (disable InfiniBand/RDMA)
-  - `NCCL_NET_GDR_LEVEL=0` (disable GPUDirect over network)
-  - `NCCL_P2P_LEVEL=NVL` (use NVLink for intra-node P2P)
-  - `NCCL_SOCKET_IFNAME=eth0` (use TCP network interface)
-- NVSHMEM over UCX with TCP: `UCX_TLS=tcp,sm,self,cuda_copy,cuda_ipc`
-- Reduced NCCL buffer size for memory pressure: `NCCL_BUFFSIZE=2097152` (2MB)
-- Reduced socket threads to avoid allocation errors: `NCCL_NSOCKS_PERTHREAD=2`, `NCCL_SOCKET_NTHREADS=2`
+- MoE inference with the naive (TCP-based) all-to-all backend (`VLLM_ALL2ALL_BACKEND=naive`)
+- LeaderWorkerSet creates head + worker pod topology
+- Data parallelism (16) and expert parallelism work over TCP
+- Service becomes ready and serves inference end-to-end
 
 **Why it matters:**
-Not all clusters have RDMA networking (e.g., AKS VMs with gVNIC, or cloud VMs without SR-IOV). This test validates that MoE models can still run using TCP-based all-to-all communication — the "naive" backend. Performance is lower than RDMA, but it provides a functional fallback path for environments without specialized networking hardware.
+Not all clusters have RDMA networking (e.g., AKS VMs). This test validates that MoE models can still be deployed and serve inference using TCP-based all-to-all communication — the "naive" backend. This is the broadest MoE test since it runs on any GPU cluster.
 
 **Test prompts:**
 1. "Write a hello world function in Python."
@@ -471,14 +464,14 @@ Not all clusters have RDMA networking (e.g., AKS VMs with gVNIC, or cloud VMs wi
 
 Profiles group test cases for specific scenarios and environments.
 
-| Profile | Test Cases | GPU | RDMA | Estimated Duration | Recommended Environment |
+| Profile | Test Cases | GPU | Estimated Duration | Recommended Environment |
 |---------|-----------|:---:|:---:|:---:|---|
-| `smoke` | TC-CPU-001, TC-CACHE-001 | No | No | ~10 min | Any |
-| `cpu-full` | TC-CPU-001, TC-CPU-002, TC-CPU-003, TC-CACHE-001 | No | No | ~20 min | Any |
-| `single-node-gpu` | TC-GPU-001, TC-GPU-002, TC-GPU-003, TC-CACHE-002 | Yes (1) | Partial | ~60 min | PSAP IBM Cloud, CoreWeave |
-| `cache-aware` | TC-CACHE-001, TC-CACHE-002 | Partial | No | ~25 min | PSAP IBM Cloud, CoreWeave |
-| `deepseek` | TC-MOE-001, TC-MOE-002 | Yes (8) | Partial | ~3 hours | PSAP IBM Cloud, CoreWeave |
-| `full` | All 10 test cases | Yes | Yes | ~6 hours | CoreWeave, PSAP IBM Cloud |
+| `smoke` | TC-CPU-001, TC-CACHE-001 | No | ~10 min | Any |
+| `cpu-full` | TC-CPU-001, TC-CPU-002, TC-CPU-003, TC-CACHE-001 | No | ~20 min | Any |
+| `single-node-gpu` | TC-GPU-001, TC-GPU-002, TC-GPU-003, TC-CACHE-002 | Yes (1) | ~60 min | Any GPU environment |
+| `cache-aware` | TC-CACHE-001, TC-CACHE-002 | Partial | ~25 min | Any GPU environment |
+| `deepseek` | TC-MOE-001, TC-MOE-002 | Yes (8) | ~3 hours | Any multi-GPU environment |
+| `full` | All 10 test cases | Yes | ~6 hours | Any GPU environment |
 
 ---
 
@@ -620,7 +613,7 @@ make test-single TESTCASE=deepseek-r1-dp-ep-ht PLATFORM=ocp
 
 ```bash
 make test-by-label LABELS=cpu
-make test-by-label LABELS=gpu,rdma
+make test-by-label LABELS=gpu,deepseek
 make test-by-label LABELS=moe,deepseek
 ```
 
@@ -645,7 +638,7 @@ make test-by-label LABELS=moe,deepseek
 |------|--------|------------|
 | Model download timeout | PREP phase fails | Use PVC caching (`cache.enabled=true`), increase `cache.timeout` |
 | Insufficient GPU resources | READY phase fails (pods Pending) | Check node GPU availability before running GPU profiles |
-| RDMA not available | PD tests fail | Run naive backend tests (`deepseek-coder-v2-dp-ep-naive`) instead |
+| RDMA not available | PD and high-throughput MoE tests fail to start | Run [rhaii-cluster-validation](https://github.com/opendatahub-io/rhaii-cluster-validation) first; use naive backend tests on non-RDMA clusters |
 | Image pull failure | READY phase fails | Ensure pull secrets are configured in the namespace |
 | CRD not installed | PREREQ phase fails | Follow the [deployment guide](https://github.com/opendatahub-io/rhaii-on-xks/blob/main/docs/deploying-llm-d-on-managed-kubernetes.md) first |
 | StorageClass not available | PREP phase fails | Set `STORAGE_CLASS` flag to match available class |
@@ -662,7 +655,6 @@ make test-by-label LABELS=moe,deepseek
 | `gpu` | Requires NVIDIA GPU | TC-GPU-001/002/003, TC-CACHE-002, TC-MOE-001/002 |
 | `smoke` | Quick validation | TC-CPU-001, TC-CACHE-001 |
 | `pd` / `prefill-decode` | Uses PD disaggregation | TC-CPU-003, TC-GPU-003 |
-| `rdma` | Requires RDMA networking | TC-GPU-003, TC-MOE-001 |
 | `cache-aware` / `kv-cache` | KV cache routing | TC-CACHE-001/002 |
 | `deepseek` / `moe` | DeepSeek MoE models | TC-MOE-001/002 |
 | `no-scheduler` | No EPP scheduler | TC-CPU-002, TC-GPU-002 |
