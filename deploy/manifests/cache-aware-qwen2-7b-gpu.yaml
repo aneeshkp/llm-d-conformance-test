@@ -1,0 +1,74 @@
+apiVersion: serving.kserve.io/v1alpha1
+kind: LLMInferenceService
+metadata:
+  name: qwen2-7b-kv-cache-routing
+spec:
+  model:
+    uri: hf://Qwen/Qwen2.5-7B-Instruct
+    name: Qwen/Qwen2.5-7B-Instruct
+  replicas: 2
+  router:
+    scheduler:
+      config:
+        inline:
+          apiVersion: inference.networking.x-k8s.io/v1alpha1
+          kind: EndpointPickerConfig
+          plugins:
+            - type: single-profile-handler
+            - type: precise-prefix-cache-scorer
+              parameters:
+                kvEventsConfig:
+                  zmqEndpoint: "tcp://*:5557"
+                indexerConfig:
+                  tokenProcessorConfig:
+                    blockSize: 64
+                    hashSeed: "42"
+                  kvBlockIndexConfig:
+                    enableMetrics: true
+                    metricsLoggingInterval: 60000000000
+            - type: queue-scorer
+            - type: kv-cache-utilization-scorer
+            - type: max-score-picker
+          schedulingProfiles:
+            - name: default
+              plugins:
+                - pluginRef: queue-scorer
+                  weight: 2
+                - pluginRef: kv-cache-utilization-scorer
+                  weight: 2
+                - pluginRef: prefix-cache-scorer
+                  weight: 3
+                - pluginRef: max-score-picker
+    route: {}
+    gateway: {}
+  template:
+    containers:
+      - name: main
+        env:
+          - name: VLLM_ADDITIONAL_ARGS
+            value: "--prefix-caching-hash-algo sha256 --block-size 64 --kv_transfer_config '{\"kv_connector\":\"NixlConnector\",\"kv_role\":\"kv_both\"}' --kv-events-config '{\"enable_kv_cache_events\":true,\"publisher\":\"zmq\",\"endpoint\":\"tcp://{{ ChildName .ObjectMeta.Name `-epp-service` }}:5557\",\"topic\":\"kv@${POD_IP}@Qwen/Qwen2.5-7B-Instruct\"}'"
+          - name: POD_IP
+            valueFrom:
+              fieldRef:
+                apiVersion: v1
+                fieldPath: status.podIP
+          - name: PYTHONHASHSEED
+            value: "42"
+        resources:
+          limits:
+            cpu: '4'
+            memory: 32Gi
+            nvidia.com/gpu: "1"
+          requests:
+            cpu: '2'
+            memory: 16Gi
+            nvidia.com/gpu: "1"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+            scheme: HTTPS
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          timeoutSeconds: 30
+          failureThreshold: 5

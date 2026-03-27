@@ -1,0 +1,28 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output
+reports/*.json
+
+# Go
+vendor/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Claude
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db

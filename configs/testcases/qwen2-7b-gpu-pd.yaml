@@ -1,0 +1,48 @@
+name: qwen2-7b-gpu-pd
+description: "Single-node GPU Qwen2.5-7B with prefill/decode disaggregation and RDMA"
+labels:
+  - gpu
+  - single-node-gpu
+  - qwen2
+  - prefill-decode
+  - pd
+  - rdma
+model:
+  name: Qwen/Qwen2.5-7B-Instruct
+  uri: hf://Qwen/Qwen2.5-7B-Instruct
+  displayName: qwen2-7b-instruct-pd
+  category: single-node-gpu
+  cache:
+    enabled: true
+    storageSize: 100Gi
+    keepPVC: true
+    timeout: 60m
+deployment:
+  manifestPath: deploy/manifests/qwen2-7b-gpu-pd.yaml
+  replicas: 1
+  readyTimeout: 15m
+  networkAttachment: roce-p2
+  resources:
+    cpu: "4"
+    memory: 32Gi
+    gpus: 1
+    rdma: true
+  prefill:
+    replicas: 2
+    resources:
+      cpu: "4"
+      memory: 32Gi
+      gpus: 1
+      rdma: true
+validation:
+  healthEndpoint: /health
+  healthPort: 8000
+  healthScheme: HTTPS
+  inferenceCheck: true
+  testPrompts:
+    - "Explain prefill decode disaggregation."
+  expectedCodes: [200]
+  timeout: 2m
+  retryAttempts: 3
+  retryInterval: 15s
+cleanup: true

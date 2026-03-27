@@ -1,0 +1,35 @@
+name: cache-aware-sim-cpu
+description: "Precise prefix KV cache routing with llm-d simulator (CPU, no GPU required)"
+labels:
+  - cpu
+  - cache-aware
+  - kv-cache
+  - simulator
+  - smoke
+model:
+  name: opt-125m
+  uri: hf://facebook/opt-125m
+  displayName: precise-prefix-test
+  category: cache-aware
+deployment:
+  manifestPath: deploy/manifests/cache-aware-sim-cpu.yaml
+  replicas: 2
+  readyTimeout: 5m
+  containerImage: ghcr.io/llm-d/llm-d-inference-sim:v0.5.1
+  resources:
+    cpu: "1"
+    memory: 2Gi
+    gpus: 0
+    rdma: false
+validation:
+  healthEndpoint: /health
+  healthPort: 8000
+  healthScheme: HTTP
+  inferenceCheck: true
+  testPrompts:
+    - "Hello, how are you?"
+  expectedCodes: [200]
+  timeout: 2m
+  retryAttempts: 3
+  retryInterval: 10s
+cleanup: true

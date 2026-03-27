@@ -1,0 +1,12 @@
+name: cpu-full
+description: "All CPU-only test cases including PD disaggregation and no-scheduler variants"
+platform: any
+labels:
+  - cpu
+testCases:
+  - opt-125m-cpu
+  - opt-125m-cpu-no-scheduler
+  - opt-125m-cpu-pd
+  - cache-aware-sim-cpu
+parallel: false
+timeout: 30m

@@ -1,0 +1,47 @@
+name: deepseek-coder-v2-dp-ep-naive
+description: "DeepSeek-Coder-V2-Lite with data/expert parallelism (naive backend, no RDMA)"
+labels:
+  - gpu
+  - deepseek
+  - moe
+  - dp-ep
+  - naive
+model:
+  name: deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
+  uri: hf://deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
+  displayName: deepseek-coder-v2
+  category: deepseek
+  cache:
+    enabled: true
+    storageSize: 200Gi
+    keepPVC: true
+    timeout: 120m
+deployment:
+  manifestPath: deploy/manifests/deepseek-coder-v2-dp-ep-naive.yaml
+  replicas: 1
+  serviceAccount: hfsa
+  readyTimeout: 90m
+  worker: true
+  resources:
+    cpu: "128"
+    memory: 512Gi
+    gpus: 8
+    ephemeralStorage: 100Gi
+    rdma: false
+  parallelism:
+    data: 16
+    dataLocal: 8
+    expert: true
+    tensor: 1
+validation:
+  healthEndpoint: /health
+  healthPort: 8000
+  healthScheme: HTTPS
+  inferenceCheck: true
+  testPrompts:
+    - "Write a hello world function in Python."
+  expectedCodes: [200]
+  timeout: 5m
+  retryAttempts: 3
+  retryInterval: 30s
+cleanup: true
