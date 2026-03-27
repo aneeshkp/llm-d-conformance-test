@@ -32,6 +32,7 @@ The tests cover:
 - Security testing (mTLS validation, RBAC)
 - Upgrade testing between LLM-D versions
 - Load testing / stress testing
+- **Networking and cluster validation** (RDMA connectivity, SR-IOV, GPU device plugin, CRD installation) — handled by [rhaii-cluster-validation](https://github.com/opendatahub-io/rhaii-cluster-validation). That tool should be run first to verify the cluster is healthy before running conformance tests.
 
 ### 1.4 References
 
@@ -40,6 +41,7 @@ The tests cover:
 | LLM inference service samples | https://github.com/opendatahub-io/kserve/tree/master/docs/samples/llmisvc |
 | LLM-D deployment guide | https://github.com/opendatahub-io/rhaii-on-xks/blob/main/docs/deploying-llm-d-on-managed-kubernetes.md |
 | KServe LLMInferenceService CRD | https://github.com/opendatahub-io/kserve |
+| Cluster validation tool | https://github.com/opendatahub-io/rhaii-cluster-validation |
 | Test framework repo | https://github.com/aneeshkp/llm-d-conformance-test |
 
 ---
@@ -51,7 +53,7 @@ The tests cover:
 | Environment Name | Platform | Infrastructure | RDMA Networking | GPUs | Storage |
 |-----------------|----------|---------------|-----------------|------|---------|
 | coreweave-waldorf | CKS | Bare-metal | InfiniBand | H100/H200 | Local NVMe |
-| AKS cluster | AKS | VMs | TCP (no RDMA) | None | managed-csi |
+| AKS cluster | AKS | VMs | TCP (no RDMA) | H100/A100 | managed-csi |
 | PSAP IBM Cloud | OCP | VMs | RoCE | 4x8xH100 (32 GPUs) | gp3-csi |
 | PSAP B200 Cluster | OCP | Bare-metal | RoCE | 2xB200 | standard-csi |
 
@@ -60,8 +62,8 @@ The tests cover:
 | Capability | coreweave-waldorf | AKS | PSAP IBM Cloud | PSAP B200 |
 |-----------|:---:|:---:|:---:|:---:|
 | CPU-only workloads | Yes | Yes | Yes | Yes |
-| Single GPU (1x) | Yes | No | Yes | Yes |
-| Multi-GPU (8x) | Yes | No | Yes | Yes |
+| Single GPU (1x) | Yes | Yes | Yes | Yes |
+| Multi-GPU (8x) | Yes | Yes | Yes | Yes |
 | RDMA / RoCE | Yes (IB) | No | Yes (RoCE) | Yes (RoCE) |
 | NVLink (intra-node P2P) | Yes | No | Yes | Yes |
 | SR-IOV networking | Yes | No | Yes | Yes |
@@ -77,12 +79,12 @@ The tests cover:
 | opt-125m-cpu-no-scheduler | Yes | Yes | Yes | Yes |
 | opt-125m-cpu-pd | Yes | Yes | Yes | Yes |
 | cache-aware-sim-cpu | Yes | Yes | Yes | Yes |
-| cache-aware-qwen2-7b-gpu | Yes | No | Yes | Yes |
-| qwen2-7b-gpu | Yes | No | Yes | Yes |
-| qwen2-7b-gpu-no-scheduler | Yes | No | Yes | Yes |
-| qwen2-7b-gpu-pd | Yes | No | Yes | Yes |
-| deepseek-r1-dp-ep-ht | Yes | No | Yes | Yes |
-| deepseek-coder-v2-dp-ep-naive | Yes | No | Yes | Yes |
+| cache-aware-qwen2-7b-gpu | Yes | Yes | Yes | Yes |
+| qwen2-7b-gpu | Yes | Yes | Yes | Yes |
+| qwen2-7b-gpu-no-scheduler | Yes | Yes | Yes | Yes |
+| qwen2-7b-gpu-pd | Yes | No (no RDMA) | Yes (RoCE) | Yes (RoCE) |
+| deepseek-r1-dp-ep-ht | Yes (IB) | No (no RDMA) | Yes (RoCE) | Yes (RoCE) |
+| deepseek-coder-v2-dp-ep-naive | Yes | Yes (TCP/naive) | Yes | Yes |
 
 ---
 
