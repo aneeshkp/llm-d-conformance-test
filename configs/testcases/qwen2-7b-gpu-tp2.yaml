@@ -1,28 +1,29 @@
-name: qwen2-7b-gpu
-description: "1 GPU - Qwen2.5-7B with scheduler"
+name: qwen2-7b-gpu-tp2
+description: "2 GPUs - Qwen2.5-7B with tensor parallelism (TP=2)"
 labels:
   - gpu
-  - smoke
   - single-node-gpu
   - qwen2
+  - tensor-parallel
+  - tp
 model:
   name: Qwen/Qwen2.5-7B-Instruct
   uri: hf://Qwen/Qwen2.5-7B-Instruct
-  displayName: qwen2-7b-instruct-single
+  displayName: qwen2-7b-instruct-tp2
   category: single-node-gpu
   cache:
     enabled: true
     storageSize: 100Gi
-    keepPVC: true       # reuse cached model across test runs
+    keepPVC: true
     timeout: 60m
 deployment:
-  manifestPath: qwen2-7b-gpu.yaml
-  replicas: 3
+  manifestPath: qwen2-7b-gpu-tp2.yaml
+  replicas: 1
   readyTimeout: 15m
   resources:
     cpu: "4"
     memory: 32Gi
-    gpus: 1
+    gpus: 2
     rdma: false
 validation:
   healthEndpoint: /health
@@ -30,8 +31,8 @@ validation:
   healthScheme: HTTPS
   inferenceCheck: true
   testPrompts:
-    - "What is Kubernetes?"
-    - "Explain containerization."
+    - "What is tensor parallelism?"
+    - "Explain model sharding across GPUs."
   expectedCodes: [200]
   timeout: 2m
   retryAttempts: 3

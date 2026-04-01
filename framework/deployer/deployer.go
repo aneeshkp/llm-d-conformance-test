@@ -28,6 +28,8 @@ type Deployer struct {
 	Kubeconfig string
 	Platform   Platform
 	Namespace  string
+	// LogFunc is called with progress messages. If nil, progress is silent.
+	LogFunc func(format string, args ...interface{})
 }
 
 // New creates a Deployer for the given platform and namespace.
@@ -36,6 +38,12 @@ func New(kubeconfig string, platform Platform, namespace string) *Deployer {
 		Kubeconfig: kubeconfig,
 		Platform:   platform,
 		Namespace:  namespace,
+	}
+}
+
+func (d *Deployer) logProgress(format string, args ...interface{}) {
+	if d.LogFunc != nil {
+		d.LogFunc(format, args...)
 	}
 }
 
@@ -49,7 +57,7 @@ type DeployResult struct {
 	Logs      []string
 }
 
-// Deploy applies a test case's manifest to the cluster.
+// Deploy applies a test case's LLMInferenceService manifest to the cluster.
 func (d *Deployer) Deploy(ctx context.Context, tc *config.TestCase) *DeployResult {
 	start := time.Now()
 	result := &DeployResult{
@@ -81,7 +89,7 @@ func (d *Deployer) Deploy(ctx context.Context, tc *config.TestCase) *DeployResul
 		return result
 	}
 
-	output, err := d.kubectl(ctx, "apply", "-n", ns, "-f", manifestPath)
+	output, err := d.Kubectl(ctx, "apply", "-n", ns, "-f", manifestPath)
 	if err != nil {
 		result.Error = fmt.Errorf("applying manifest %s: %w\nOutput: %s", manifestPath, err, output)
 		result.Duration = time.Since(start)
@@ -95,7 +103,8 @@ func (d *Deployer) Deploy(ctx context.Context, tc *config.TestCase) *DeployResul
 	return result
 }
 
-// WaitForReady waits for the LLMInferenceService to become ready.
+// WaitForReady waits for the LLMInferenceService to become ready,
+// showing detailed status of all sub-resources during the wait.
 func (d *Deployer) WaitForReady(ctx context.Context, tc *config.TestCase) error {
 	ns := d.resolveNamespace(tc)
 	timeout := tc.Deployment.ReadyTimeout.Duration
@@ -103,26 +112,135 @@ func (d *Deployer) WaitForReady(ctx context.Context, tc *config.TestCase) error 
 		timeout = 10 * time.Minute
 	}
 
-	name := extractLLMISVCName(tc)
-
+	name := ExtractLLMISVCName(tc)
+	waitStart := time.Now()
 	return retry.UntilSuccess(ctx, retry.Options{
 		Timeout:  timeout,
 		Interval: 15 * time.Second,
 		Name:     fmt.Sprintf("wait-ready-%s", name),
 	}, func() error {
-		output, err := d.kubectl(ctx, "get", "llmisvc", name, "-n", ns, "-o", "jsonpath={.status.ready}")
-		if err != nil {
-			return fmt.Errorf("checking llmisvc ready status: %w (output: %s)", err, output)
+		// Call 1: Get llmisvc status (ready + reason + url in one call)
+		llmStatus, _ := d.Kubectl(ctx, "get", "llmisvc", name, "-n", ns, "-o",
+			"jsonpath={.status.conditions[?(@.type==\"Ready\")].status}|{.status.conditions[?(@.type==\"Ready\")].reason}|{.status.url}")
+		parts := strings.SplitN(llmStatus, "|", 3)
+		ready, reason := "", ""
+		if len(parts) >= 1 {
+			ready = strings.TrimSpace(parts[0])
 		}
-		if strings.TrimSpace(output) != "True" && strings.TrimSpace(output) != "true" {
-			// Also check pod readiness as a fallback
-			podOutput, _ := d.kubectl(ctx, "get", "pods", "-n", ns, "-l",
-				fmt.Sprintf("app.kubernetes.io/instance=%s", name),
-				"-o", "jsonpath={.items[*].status.phase}")
-			return fmt.Errorf("llmisvc %s not ready yet (status: %q, pods: %s)", name, output, podOutput)
+		if len(parts) >= 2 {
+			reason = strings.TrimSpace(parts[1])
 		}
-		return nil
+
+		if strings.EqualFold(ready, "true") {
+			d.logProgress("─── [%s] READY ───", name)
+			return nil
+		}
+		if reason == "" {
+			reason = "Waiting"
+		}
+
+		elapsed := time.Since(waitStart).Truncate(time.Second)
+		remaining := (timeout - time.Since(waitStart)).Truncate(time.Second)
+		if remaining < 0 {
+			remaining = 0
+		}
+
+		// Call 2: Get all sub-resources in one call
+		label := fmt.Sprintf("app.kubernetes.io/name=%s", name)
+		subOut, _ := d.Kubectl(ctx, "get", "svc,pods", "-n", ns, "-l", label,
+			"-o", "jsonpath=svc:{.items[?(@.kind==\"Service\")].metadata.name} pod:{range .items[?(@.kind==\"Pod\")]}{.status.phase}/{range .status.containerStatuses[*]}{.ready}{end} {end}")
+		// Parse sub-resource output
+		svc, podStatus := "no", "none"
+		for _, part := range strings.Fields(subOut) {
+			if strings.HasPrefix(part, "svc:") {
+				if v := strings.TrimPrefix(part, "svc:"); v != "" {
+					svc = "ok"
+				}
+			} else {
+				podStatus = part
+			}
+		}
+
+		// Check route and pool (these are different API groups, need separate calls)
+		// Combined into one shell with ;
+		routePool, _ := d.Kubectl(ctx, "get", "httproute,inferencepool", "-n", ns,
+			"--ignore-not-found=true",
+			"-o", "jsonpath=route:{.items[?(@.kind==\"HTTPRoute\")].metadata.name} pool:{.items[?(@.kind==\"InferencePool\")].metadata.name}")
+		route, pool := "no", "no"
+		for _, part := range strings.Fields(routePool) {
+			if strings.HasPrefix(part, "route:") {
+				if v := strings.TrimPrefix(part, "route:"); v != "" {
+					route = "ok"
+				}
+			}
+			if strings.HasPrefix(part, "pool:") {
+				if v := strings.TrimPrefix(part, "pool:"); v != "" {
+					pool = "ok"
+				}
+			}
+		}
+
+		d.logProgress("[%s] %s | svc=%s route=%s pool=%s pod=%s | %s/%s",
+			name, reason, svc, route, pool, podStatus, elapsed, remaining)
+
+		// Call 3: Show last vLLM log line (only call that can't be combined)
+		vllmLog, _ := d.Kubectl(ctx, "logs", "-n", ns, "-l",
+			fmt.Sprintf("app.kubernetes.io/name=%s,app.kubernetes.io/component=llminferenceservice-workload", name),
+			"-c", "main", "--tail=1")
+		if vllmLog = strings.TrimSpace(vllmLog); vllmLog != "" &&
+			!strings.Contains(vllmLog, "Defaulted container") &&
+			!strings.Contains(vllmLog, "Error from server") &&
+			!strings.Contains(vllmLog, "is waiting to start") &&
+			!strings.Contains(vllmLog, "PodInitializing") {
+			d.logProgress("  vLLM: %s", vllmLog)
+		}
+
+		return fmt.Errorf("llmisvc %s not ready (READY=%s, REASON=%s)", name, ready, reason)
 	})
+}
+
+func (d *Deployer) getField(ctx context.Context, kind, name, ns, jsonpath string) string {
+	output, err := d.Kubectl(ctx, "get", kind, name, "-n", ns, "-o", fmt.Sprintf("jsonpath=%s", jsonpath))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(output)
+}
+
+// CheckResourceExists checks if a named Kubernetes resource exists in the namespace.
+func (d *Deployer) CheckResourceExists(ctx context.Context, kind, name, ns string) (bool, error) {
+	out, err := d.Kubectl(ctx, "get", kind, "-n", ns, "-l",
+		fmt.Sprintf("app.kubernetes.io/name=%s", name),
+		"-o", "jsonpath={.items[*].metadata.name}")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
+// CheckInferencePoolExists checks if any InferencePool exists in the namespace.
+func (d *Deployer) CheckInferencePoolExists(ctx context.Context, ns string) (bool, error) {
+	out, err := d.Kubectl(ctx, "get", "inferencepool", "-n", ns,
+		"--ignore-not-found=true",
+		"-o", "jsonpath={.items[*].metadata.name}")
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(out) != "", nil
+}
+
+// GetPodStatus returns pod status lines for pods matching the given llmisvc name.
+func (d *Deployer) GetPodStatus(ctx context.Context, name, ns string) (string, error) {
+	return d.Kubectl(ctx, "get", "pods", "-n", ns, "-l",
+		fmt.Sprintf("app.kubernetes.io/name=%s", name),
+		"-o", "jsonpath={range .items[*]}{.metadata.name} {.status.phase} restarts={range .status.containerStatuses[*]}{.restartCount}{end}{\"\\n\"}{end}")
+}
+
+// GetPodLogs returns the last N lines of logs from the main container.
+func (d *Deployer) GetPodLogs(ctx context.Context, name, ns string, tail int) (string, error) {
+	return d.Kubectl(ctx, "logs", "-n", ns, "-l",
+		fmt.Sprintf("app.kubernetes.io/name=%s", name),
+		"-c", "main", fmt.Sprintf("--tail=%d", tail))
 }
 
 // Cleanup deletes all resources for a test case.
@@ -134,20 +252,20 @@ func (d *Deployer) Cleanup(ctx context.Context, tc *config.TestCase) error {
 		return fmt.Errorf("no manifest path for cleanup of %s", tc.Name)
 	}
 
-	output, err := d.kubectl(ctx, "delete", "-n", ns, "-f", manifestPath, "--ignore-not-found=true", "--timeout=120s")
+	output, err := d.Kubectl(ctx, "delete", "-n", ns, "-f", manifestPath, "--ignore-not-found=true", "--timeout=120s")
 	if err != nil {
 		return fmt.Errorf("cleanup failed for %s: %w\nOutput: %s", tc.Name, err, output)
 	}
 
 	// Wait for pods to terminate
-	name := extractLLMISVCName(tc)
+	name := ExtractLLMISVCName(tc)
 	_ = retry.UntilSuccess(ctx, retry.Options{
 		Timeout:  2 * time.Minute,
 		Interval: 5 * time.Second,
 		Name:     fmt.Sprintf("cleanup-wait-%s", name),
 	}, func() error {
-		output, err := d.kubectl(ctx, "get", "pods", "-n", ns, "-l",
-			fmt.Sprintf("app.kubernetes.io/instance=%s", name),
+		output, err := d.Kubectl(ctx, "get", "pods", "-n", ns, "-l",
+			fmt.Sprintf("app.kubernetes.io/name=%s", name),
 			"-o", "jsonpath={.items}")
 		if err != nil {
 			return nil // kubectl error likely means resources are gone
@@ -163,7 +281,7 @@ func (d *Deployer) Cleanup(ctx context.Context, tc *config.TestCase) error {
 
 // CleanupNamespace deletes the entire namespace.
 func (d *Deployer) CleanupNamespace(ctx context.Context, namespace string) error {
-	output, err := d.kubectl(ctx, "delete", "namespace", namespace, "--ignore-not-found=true", "--timeout=120s")
+	output, err := d.Kubectl(ctx, "delete", "namespace", namespace, "--ignore-not-found=true", "--timeout=120s")
 	if err != nil {
 		return fmt.Errorf("deleting namespace %s: %w\nOutput: %s", namespace, err, output)
 	}
@@ -173,9 +291,9 @@ func (d *Deployer) CleanupNamespace(ctx context.Context, namespace string) error
 // GetServiceEndpoint returns the inference service URL.
 func (d *Deployer) GetServiceEndpoint(ctx context.Context, tc *config.TestCase) (string, error) {
 	ns := d.resolveNamespace(tc)
-	name := extractLLMISVCName(tc)
+	name := ExtractLLMISVCName(tc)
 
-	output, err := d.kubectl(ctx, "get", "llmisvc", name, "-n", ns, "-o", "jsonpath={.status.url}")
+	output, err := d.Kubectl(ctx, "get", "llmisvc", name, "-n", ns, "-o", "jsonpath={.status.url}")
 	if err != nil {
 		return "", fmt.Errorf("getting service endpoint: %w", err)
 	}
@@ -183,8 +301,8 @@ func (d *Deployer) GetServiceEndpoint(ctx context.Context, tc *config.TestCase) 
 	url := strings.TrimSpace(output)
 	if url == "" {
 		// Fallback: try to get the service ClusterIP
-		svcOutput, err := d.kubectl(ctx, "get", "svc", "-n", ns, "-l",
-			fmt.Sprintf("app.kubernetes.io/instance=%s", name),
+		svcOutput, err := d.Kubectl(ctx, "get", "svc", "-n", ns, "-l",
+			fmt.Sprintf("app.kubernetes.io/name=%s", name),
 			"-o", "jsonpath={.items[0].spec.clusterIP}")
 		if err != nil || strings.TrimSpace(svcOutput) == "" {
 			return "", fmt.Errorf("no endpoint found for llmisvc %s", name)
@@ -203,11 +321,11 @@ func (d *Deployer) GetServiceEndpoint(ctx context.Context, tc *config.TestCase) 
 	return url, nil
 }
 
-// GetPlatformInfo gathers cluster version info for reporting.
+// GetPlatformInfo gathers cluster, KServe, and vLLM version info for reporting.
 func (d *Deployer) GetPlatformInfo(ctx context.Context) map[string]string {
 	info := make(map[string]string)
 
-	if output, err := d.kubectl(ctx, "version", "--short", "-o", "json"); err == nil {
+	if output, err := d.Kubectl(ctx, "version", "-o", "json"); err == nil {
 		info["kubernetesVersionRaw"] = output
 	}
 
@@ -223,9 +341,34 @@ func (d *Deployer) GetPlatformInfo(ctx context.Context) map[string]string {
 		info["platform"] = "gks"
 	}
 
-	if output, err := d.kubectl(ctx, "get", "nodes", "-o",
+	if output, err := d.Kubectl(ctx, "get", "nodes", "-o",
 		"jsonpath={.items[0].status.nodeInfo.kubeletVersion}"); err == nil {
 		info["kubeletVersion"] = strings.TrimSpace(output)
+	}
+
+	// KServe version — from the controller deployment image tag
+	for _, ns := range []string{"opendatahub", "kserve", "kserve-system"} {
+		output, err := d.Kubectl(ctx, "get", "deployment", "-n", ns, "-l",
+			"control-plane=kserve-controller-manager",
+			"-o", "jsonpath={.items[0].spec.template.spec.containers[0].image}")
+		if err == nil && strings.TrimSpace(output) != "" {
+			info["kserveImage"] = strings.TrimSpace(output)
+			// Extract version from image tag (e.g., "image:v0.15.1" → "v0.15.1")
+			if idx := strings.LastIndex(output, ":"); idx >= 0 {
+				info["kserveVersion"] = output[idx+1:]
+			}
+			break
+		}
+	}
+
+	// vLLM image — from the inferenceservice-config configmap
+	for _, ns := range []string{"opendatahub", "kserve", "kserve-system"} {
+		output, err := d.Kubectl(ctx, "get", "configmap", "inferenceservice-config", "-n", ns,
+			"-o", "jsonpath={.data.storageInitializer}")
+		if err == nil && strings.TrimSpace(output) != "" {
+			info["storageInitializerConfig"] = strings.TrimSpace(output)
+			break
+		}
 	}
 
 	return info
@@ -233,7 +376,7 @@ func (d *Deployer) GetPlatformInfo(ctx context.Context) map[string]string {
 
 // CheckCRDExists verifies a CRD is installed on the cluster.
 func (d *Deployer) CheckCRDExists(ctx context.Context, crdName string) (bool, error) {
-	output, err := d.kubectl(ctx, "get", "crd", crdName, "--ignore-not-found=true")
+	output, err := d.Kubectl(ctx, "get", "crd", crdName, "--ignore-not-found=true")
 	if err != nil {
 		return false, err
 	}
@@ -241,15 +384,16 @@ func (d *Deployer) CheckCRDExists(ctx context.Context, crdName string) (bool, er
 }
 
 func (d *Deployer) ensureNamespace(ctx context.Context, ns string) error {
-	_, err := d.kubectl(ctx, "get", "namespace", ns)
+	_, err := d.Kubectl(ctx, "get", "namespace", ns)
 	if err == nil {
 		return nil // namespace exists
 	}
-	_, err = d.kubectl(ctx, "create", "namespace", ns)
+	_, err = d.Kubectl(ctx, "create", "namespace", ns)
 	return err
 }
 
-func (d *Deployer) kubectl(ctx context.Context, args ...string) (string, error) {
+// Kubectl runs a kubectl command with the deployer's kubeconfig and platform settings.
+func (d *Deployer) Kubectl(ctx context.Context, args ...string) (string, error) {
 	cmdArgs := make([]string, 0, len(args)+2)
 	if d.Kubeconfig != "" {
 		cmdArgs = append(cmdArgs, "--kubeconfig", d.Kubeconfig)
@@ -283,9 +427,9 @@ func (d *Deployer) resolveNamespace(tc *config.TestCase) string {
 	return "llm-test"
 }
 
-// extractLLMISVCName extracts the LLMInferenceService name from the test case.
+// ExtractLLMISVCName extracts the LLMInferenceService name from the test case.
 // It derives it from the model display name or test case name.
-func extractLLMISVCName(tc *config.TestCase) string {
+func ExtractLLMISVCName(tc *config.TestCase) string {
 	if tc.Model.DisplayName != "" {
 		return sanitizeK8sName(tc.Model.DisplayName)
 	}

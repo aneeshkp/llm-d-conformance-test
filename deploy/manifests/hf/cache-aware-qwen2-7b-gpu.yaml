@@ -42,6 +42,8 @@ spec:
     route: {}
     gateway: {}
   template:
+    imagePullSecrets:
+    - name: redhat-pull-secret
     containers:
       - name: main
         env:

@@ -5,6 +5,7 @@ package smoke
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -84,14 +85,8 @@ var _ = Describe("Framework Smoke Tests", func() {
 			allCases, err := config.LoadTestCasesFromDir(testCaseDir)
 			Expect(err).NotTo(HaveOccurred())
 
-			cpuCases := config.FilterTestCasesByLabels(allCases, []string{"cpu"})
-			Expect(cpuCases).NotTo(BeEmpty(), "Expected CPU test cases")
-			for _, tc := range cpuCases {
-				Expect(tc.Deployment.Resources.GPUs).To(Equal(0),
-					"CPU-labeled test case %s should have 0 GPUs", tc.Name)
-			}
-
 			gpuCases := config.FilterTestCasesByLabels(allCases, []string{"gpu"})
+			Expect(gpuCases).NotTo(BeEmpty(), "Expected GPU test cases")
 			for _, tc := range gpuCases {
 				Expect(tc.Deployment.Resources.GPUs).To(BeNumerically(">", 0),
 					"GPU-labeled test case %s should have >0 GPUs", tc.Name)
@@ -103,9 +98,9 @@ var _ = Describe("Framework Smoke Tests", func() {
 			allCases, err := config.LoadTestCasesFromDir(testCaseDir)
 			Expect(err).NotTo(HaveOccurred())
 
-			filtered := config.FilterTestCasesByNames(allCases, []string{"opt-125m-cpu"})
+			filtered := config.FilterTestCasesByNames(allCases, []string{"qwen2-7b-gpu"})
 			Expect(filtered).To(HaveLen(1))
-			Expect(filtered[0].Name).To(Equal("opt-125m-cpu"))
+			Expect(filtered[0].Name).To(Equal("qwen2-7b-gpu"))
 		})
 	})
 
@@ -117,12 +112,14 @@ var _ = Describe("Framework Smoke Tests", func() {
 
 			rootDir := findRootDir()
 			for _, tc := range cases {
-				manifestPath := filepath.Join(rootDir, tc.Deployment.ManifestPath)
-				_, err := os.Stat(manifestPath)
-				Expect(err).NotTo(HaveOccurred(),
-					"Manifest %s for test case %s does not exist", tc.Deployment.ManifestPath, tc.Name)
-
-				GinkgoWriter.Printf("  Verified manifest: %s\n", tc.Deployment.ManifestPath)
+				// Check both hf/ and pvc/ variants exist
+				for _, variant := range []string{"hf", "pvc"} {
+					manifestPath := filepath.Join(rootDir, "deploy", "manifests", variant, tc.Deployment.ManifestPath)
+					_, err := os.Stat(manifestPath)
+					Expect(err).NotTo(HaveOccurred(),
+						"Manifest %s/%s for test case %s does not exist", variant, tc.Deployment.ManifestPath, tc.Name)
+				}
+				GinkgoWriter.Printf("  Verified manifest (hf + pvc): %s\n", tc.Deployment.ManifestPath)
 			}
 		})
 	})
@@ -165,17 +162,26 @@ var _ = Describe("Framework Smoke Tests", func() {
 				},
 			})
 
-			path, err := rep.Finalize()
+			htmlPath, err := rep.Finalize()
 			Expect(err).NotTo(HaveOccurred())
-			Expect(path).To(BeAnExistingFile())
+			Expect(htmlPath).To(BeAnExistingFile())
 
-			data, err := os.ReadFile(path)
+			// Verify JSON report (same dir, .json extension)
+			jsonPath := strings.TrimSuffix(htmlPath, ".html") + ".json"
+			Expect(jsonPath).To(BeAnExistingFile())
+			data, err := os.ReadFile(jsonPath)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(string(data)).To(ContainSubstring(`"total": 2`))
 			Expect(string(data)).To(ContainSubstring(`"passed": 1`))
 			Expect(string(data)).To(ContainSubstring(`"failed": 1`))
 
-			GinkgoWriter.Printf("  Report written to: %s\n", path)
+			// Verify HTML report
+			htmlData, err := os.ReadFile(htmlPath)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(string(htmlData)).To(ContainSubstring("LLM-D Conformance Report"))
+
+			GinkgoWriter.Printf("  JSON report: %s\n", jsonPath)
+			GinkgoWriter.Printf("  HTML report: %s\n", htmlPath)
 		})
 	})
 })

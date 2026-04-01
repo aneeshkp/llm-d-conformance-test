@@ -4,7 +4,7 @@ metadata:
   name: deepseek-coder-v2
 spec:
   model:
-    uri: hf://deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
+    uri: pvc://model-cache-deepseek-ai-deepseek-coder-v2-lite-instruct/DeepSeek-Coder-V2-Lite-Instruct
     name: deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
   replicas: 1
   parallelism:
@@ -17,6 +17,8 @@ spec:
     route: {}
     gateway: {}
   template:
+    imagePullSecrets:
+    - name: redhat-pull-secret
     serviceAccountName: hfsa
     containers:
       - name: main

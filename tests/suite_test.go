@@ -3,6 +3,7 @@ package tests
 import (
 	"flag"
 	"os"
+	"path/filepath"
 	"testing"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -20,6 +21,11 @@ var (
 	testCaseName string
 	labels       string
 	storageClass string
+	// Discover mode: validate an existing deployment without deploying
+	testMode    string
+	endpoint    string
+	modelSource string // "pvc" (default) or "hf"
+	noCleanup   bool
 )
 
 func init() {
@@ -32,9 +38,40 @@ func init() {
 	flag.StringVar(&testCaseName, "testcase", "", "Run a single test case by name (overrides profile)")
 	flag.StringVar(&labels, "labels", "", "Comma-separated labels to filter test cases (overrides profile)")
 	flag.StringVar(&storageClass, "storage-class", "", "Kubernetes StorageClass for model cache PVCs (uses cluster default if empty)")
+	flag.StringVar(&testMode, "mode", "deploy", "Test mode: 'deploy' (full lifecycle), 'discover' (validate existing), or 'cache' (download models only)")
+	flag.StringVar(&endpoint, "endpoint", "", "Service endpoint URL for discover mode (e.g., http://my-llm-svc:8000)")
+	flag.StringVar(&modelSource, "model-source", "pvc", "Model source: 'pvc' (download to PVC first, default) or 'hf' (vLLM downloads from HuggingFace at startup)")
+	flag.BoolVar(&noCleanup, "no-cleanup", false, "Skip cleanup after tests (leave resources running for debugging)")
+}
+
+// findRootDir walks up from the current working directory to find the project root (containing go.mod).
+func findRootDir() string {
+	for _, c := range []string{"..", "../..", "."} {
+		if _, err := os.Stat(filepath.Join(c, "go.mod")); err == nil {
+			abs, _ := filepath.Abs(c)
+			return abs
+		}
+	}
+	return "."
+}
+
+// resolveRelativePath makes a relative path absolute by joining it with the project root.
+func resolveRelativePath(p string) string {
+	if filepath.IsAbs(p) {
+		return p
+	}
+	return filepath.Join(findRootDir(), p)
 }
 
 func TestLLMDConformance(t *testing.T) {
+	// Resolve relative paths against the project root since go test
+	// sets the working directory to the test package directory.
+	testCaseDir = resolveRelativePath(testCaseDir)
+	if profilePath != "" {
+		profilePath = resolveRelativePath(profilePath)
+	}
+	reportDir = resolveRelativePath(reportDir)
+
 	RegisterFailHandler(Fail)
 	RunSpecs(t, "LLM-D Conformance Test Suite")
 }

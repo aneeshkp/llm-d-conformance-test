@@ -1,5 +1,5 @@
 name: qwen2-7b-gpu-no-scheduler
-description: "Single-node GPU Qwen2.5-7B without scheduler - K8s native routing"
+description: "1 GPU - Qwen2.5-7B without scheduler, K8s native routing"
 labels:
   - gpu
   - single-node-gpu
@@ -16,7 +16,7 @@ model:
     keepPVC: true
     timeout: 60m
 deployment:
-  manifestPath: deploy/manifests/qwen2-7b-gpu-no-scheduler.yaml
+  manifestPath: qwen2-7b-gpu-no-scheduler.yaml
   replicas: 3
   readyTimeout: 15m
   resources:

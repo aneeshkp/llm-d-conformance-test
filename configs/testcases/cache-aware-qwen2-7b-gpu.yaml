@@ -1,5 +1,5 @@
 name: cache-aware-qwen2-7b-gpu
-description: "Precise prefix KV cache routing with real Qwen2.5-7B GPU model"
+description: "2 GPUs - Qwen2.5-7B with prefix KV cache-aware routing (2 replicas)"
 labels:
   - gpu
   - cache-aware
@@ -16,7 +16,7 @@ model:
     keepPVC: true
     timeout: 60m
 deployment:
-  manifestPath: deploy/manifests/cache-aware-qwen2-7b-gpu.yaml
+  manifestPath: cache-aware-qwen2-7b-gpu.yaml
   replicas: 2
   readyTimeout: 15m
   resources:
