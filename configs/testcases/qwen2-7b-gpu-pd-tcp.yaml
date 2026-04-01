@@ -1,23 +1,25 @@
-name: qwen2-7b-gpu
-description: "1 GPU - Qwen2.5-7B with scheduler"
+name: qwen2-7b-gpu-pd-tcp
+description: "3 GPUs - Qwen2.5-7B P/D over TCP (2 decode + 1 prefill)"
 labels:
   - gpu
-  - smoke
-  - single-node-gpu
+  - multi-node-gpu
   - qwen2
+  - prefill-decode
+  - pd
+  - tcp
 model:
   name: Qwen/Qwen2.5-7B-Instruct
   uri: hf://Qwen/Qwen2.5-7B-Instruct
-  displayName: qwen2-7b-instruct-single
-  category: single-node-gpu
+  displayName: qwen2-7b-instruct-pd-tcp
+  category: multi-node-gpu
   cache:
     enabled: true
     storageSize: 100Gi
-    keepPVC: true       # reuse cached model across test runs
+    keepPVC: true
     timeout: 60m
 deployment:
-  manifestPath: qwen2-7b-gpu.yaml
-  replicas: 3
+  manifestPath: qwen2-7b-gpu-pd-tcp.yaml
+  replicas: 1
   readyTimeout: 15m
   resources:
     cpu: "4"
@@ -30,8 +32,8 @@ validation:
   healthScheme: HTTPS
   inferenceCheck: true
   testPrompts:
-    - "What is Kubernetes?"
-    - "Explain containerization."
+    - "What is prefill decode disaggregation?"
+    - "Explain KV cache transfer."
   expectedCodes: [200]
   timeout: 2m
   retryAttempts: 3

@@ -67,7 +67,6 @@ type DeployConfig struct {
 	Prefill         *PrefillConfig    `yaml:"prefill,omitempty"`
 	Worker          bool              `yaml:"worker"`
 	NetworkAttach   string            `yaml:"networkAttachment,omitempty"`
-	ContainerImage  string            `yaml:"containerImage,omitempty"`
 	EnvOverrides    map[string]string `yaml:"envOverrides,omitempty"`
 }
 

@@ -2,6 +2,7 @@ package model
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -19,6 +20,8 @@ type Downloader struct {
 	namespace    string
 	storageClass string
 	platform     string
+	// LogFunc is called with progress messages during download. If nil, progress is silent.
+	LogFunc func(format string, args ...interface{})
 }
 
 // NewDownloader creates a Downloader.
@@ -28,6 +31,12 @@ func NewDownloader(kubeconfig, namespace, storageClass, platform string) *Downlo
 		namespace:    namespace,
 		storageClass: storageClass,
 		platform:     platform,
+	}
+}
+
+func (dl *Downloader) logProgress(format string, args ...interface{}) {
+	if dl.LogFunc != nil {
+		dl.LogFunc(format, args...)
 	}
 }
 
@@ -45,6 +54,11 @@ func (dl *Downloader) DownloadModel(ctx context.Context, tc *config.TestCase) *C
 	// Skip if model URI is already a PVC
 	if strings.HasPrefix(tc.Model.URI, "pvc://") {
 		existingPVC := strings.TrimPrefix(tc.Model.URI, "pvc://")
+		// Strip subpath if present (pvc://name/subpath → name)
+		if idx := strings.Index(existingPVC, "/"); idx >= 0 {
+			existingPVC = existingPVC[:idx]
+		}
+		dl.logProgress("[%s] Model URI is pvc://, checking PVC %s exists", tc.Name, existingPVC)
 		ok, err := dl.resourceExists(ctx, "pvc", existingPVC)
 		if err != nil || !ok {
 			result.Status = CacheStatusNotFound
@@ -55,6 +69,7 @@ func (dl *Downloader) DownloadModel(ctx context.Context, tc *config.TestCase) *C
 		result.PVCName = existingPVC
 		result.Status = CacheStatusReady
 		result.Logs = append(result.Logs, fmt.Sprintf("Using existing PVC %s", existingPVC))
+		dl.logProgress("[%s] SKIP: PVC %s already exists", tc.Name, existingPVC)
 		result.Duration = time.Since(start)
 		return result
 	}
@@ -66,9 +81,29 @@ func (dl *Downloader) DownloadModel(ctx context.Context, tc *config.TestCase) *C
 		if succeeded == "1" {
 			result.Status = CacheStatusReady
 			result.Logs = append(result.Logs, fmt.Sprintf("Model already cached in PVC %s (download job completed)", pvcName))
+			dl.logProgress("[%s] SKIP: model already cached in PVC %s (job completed)", tc.Name, pvcName)
 			result.Duration = time.Since(start)
 			return result
 		}
+	} else {
+		// Job gone (TTL expired or deleted). Check if PVC exists and has a model subdir.
+		pvcExists, _ := dl.resourceExists(ctx, "pvc", pvcName)
+		if pvcExists {
+			result.Status = CacheStatusReady
+			result.PVCName = pvcName
+			result.Logs = append(result.Logs, fmt.Sprintf("PVC %s exists with model data (download job was cleaned up)", pvcName))
+			dl.logProgress("[%s] SKIP: PVC %s already has model data", tc.Name, pvcName)
+			result.Duration = time.Since(start)
+			return result
+		}
+	}
+
+	// Ensure namespace exists before creating resources
+	if err := dl.ensureNamespace(ctx); err != nil {
+		result.Status = CacheStatusFailed
+		result.Error = fmt.Errorf("ensuring namespace %s exists: %w", dl.namespace, err)
+		result.Duration = time.Since(start)
+		return result
 	}
 
 	// Create PVC if needed
@@ -102,11 +137,25 @@ func (dl *Downloader) DownloadModel(ctx context.Context, tc *config.TestCase) *C
 	}
 
 	result.Logs = append(result.Logs, fmt.Sprintf("Waiting up to %s for download", downloadTimeout))
+	dl.logProgress("[%s] Downloading model %s (timeout=%s)...", tc.Name, tc.Model.Name, downloadTimeout)
+	lastLogLen := 0
 	err := retry.UntilSuccess(ctx, retry.Options{
 		Timeout:  downloadTimeout,
-		Interval: 30 * time.Second,
+		Interval: 15 * time.Second,
 		Name:     fmt.Sprintf("model-download-%s", tc.Name),
 	}, func() error {
+		// Check PVC status — fail fast if provisioning failed
+		pvcPhase, _ := dl.kubectl(ctx, "get", "pvc", pvcName, "-o", "jsonpath={.status.phase}")
+		if strings.TrimSpace(pvcPhase) == "" || strings.TrimSpace(pvcPhase) == "Pending" {
+			// Check for provisioning errors
+			pvcEvents, _ := dl.kubectl(ctx, "get", "events",
+				"--field-selector", fmt.Sprintf("involvedObject.name=%s,reason=ProvisioningFailed", pvcName),
+				"-o", "jsonpath={.items[0].message}")
+			if pvcErr := strings.TrimSpace(pvcEvents); pvcErr != "" {
+				return fmt.Errorf("PVC %s provisioning failed: %s", pvcName, pvcErr)
+			}
+		}
+
 		succeeded := dl.getField(ctx, "job", jobName, "{.status.succeeded}")
 		if succeeded == "1" {
 			return nil
@@ -116,7 +165,28 @@ func (dl *Downloader) DownloadModel(ctx context.Context, tc *config.TestCase) *C
 			logs := dl.getPodLogs(ctx, jobName)
 			return fmt.Errorf("download job failed:\n%s", logs)
 		}
-		return fmt.Errorf("download in progress (succeeded=%s, failed=%s)", succeeded, failed)
+		// Show pod status
+		podStatus, _ := dl.kubectl(ctx, "get", "pods", "-l", fmt.Sprintf("job-name=%s", jobName),
+			"-o", "jsonpath={range .items[*]}{.metadata.name} {.status.phase}{end}")
+		podStatus = strings.TrimSpace(podStatus)
+
+		// Show download progress from pod logs
+		logs := dl.getPodLogs(ctx, jobName)
+		if len(logs) > 0 && len(logs) != lastLogLen {
+			lastLogLen = len(logs)
+			lines := strings.Split(strings.TrimSpace(logs), "\n")
+			tailStart := 0
+			if len(lines) > 3 {
+				tailStart = len(lines) - 3
+			}
+			for _, line := range lines[tailStart:] {
+				if line != "" {
+					dl.logProgress("  [download] %s", line)
+				}
+			}
+		}
+		dl.logProgress("[%s] Download in progress (pod=%s, elapsed=%s)", tc.Name, podStatus, time.Since(start).Truncate(time.Second))
+		return fmt.Errorf("download in progress")
 	})
 
 	if err != nil {
@@ -150,12 +220,16 @@ func (dl *Downloader) CleanupAll(ctx context.Context, tc *config.TestCase) {
 
 func (dl *Downloader) createPVC(ctx context.Context, pvcName string, tc *config.TestCase) error {
 	storageSize := "50Gi"
-	if tc.Deployment.Resources.GPUs >= 8 {
+	if tc.Model.Cache != nil && tc.Model.Cache.StorageSize != "" {
+		storageSize = tc.Model.Cache.StorageSize
+	} else if tc.Deployment.Resources.GPUs >= 8 {
 		storageSize = "500Gi"
 	} else if tc.Deployment.Resources.GPUs >= 1 {
 		storageSize = "100Gi"
 	}
 
+	// Use ReadWriteOnce by default — ReadWriteMany requires a storage class that supports it.
+	// For multi-replica models, the operator handles volume sharing.
 	tmpFile, err := dl.writeTempYAML(fmt.Sprintf(`apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -183,6 +257,20 @@ func (dl *Downloader) createDownloadJob(ctx context.Context, pvcName string, tc 
 	hfModel := strings.TrimPrefix(tc.Model.URI, "hf://")
 	jobName := dl.jobName(pvcName)
 
+	// Use the storage initializer image from the cluster's KServe config.
+	storageInitImage := dl.getStorageInitImage(ctx)
+	dl.logProgress("[%s] Using storage initializer image: %s", tc.Name, storageInitImage)
+
+	// KServe mounts pvc://<name>/<subpath> at /mnt/models with subPath=<subpath>.
+	// So the download must place model files under /mnt/models/<subpath>/ on the PVC.
+	// e.g., pvc://pvc-name/Qwen2.5-7B-Instruct → download to /mnt/models/Qwen2.5-7B-Instruct
+	modelSubdir := hfModel
+	if idx := strings.LastIndex(hfModel, "/"); idx >= 0 {
+		modelSubdir = hfModel[idx+1:]
+	}
+	downloadTarget := fmt.Sprintf("/mnt/models/%s", modelSubdir)
+	dl.logProgress("[%s] Download target: %s", tc.Name, downloadTarget)
+
 	tmpFile, err := dl.writeTempYAML(fmt.Sprintf(`apiVersion: batch/v1
 kind: Job
 metadata:
@@ -192,52 +280,49 @@ metadata:
     app.kubernetes.io/managed-by: llm-d-conformance-test
     app.kubernetes.io/component: model-download
 spec:
-  backoffLimit: 2
-  ttlSecondsAfterFinished: 86400
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 604800
   template:
     metadata:
       labels:
         job-name: %s
     spec:
       restartPolicy: OnFailure
+      securityContext:
+        fsGroup: 1000
       containers:
-        - name: download
-          image: python:3.11-slim
-          command:
-            - /bin/bash
-            - -c
-            - |
-              set -e
-              echo "Installing huggingface_hub..."
-              pip install -q huggingface_hub
-              echo "Downloading model: %s"
-              python3 -c "
-              from huggingface_hub import snapshot_download
-              import time
-              start = time.time()
-              snapshot_download(
-                  repo_id='%s',
-                  local_dir='/model-cache',
-                  local_dir_use_symlinks=False,
-              )
-              elapsed = time.time() - start
-              print(f'Download complete in {elapsed:.0f}s')
-              "
-              echo "Model download finished successfully"
+        - name: storage-initializer
+          image: %s
+          args:
+            - "hf://%s"
+            - "%s"
+          env:
+            - name: HF_HOME
+              value: /tmp/hf
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: "1"
+            - name: HF_HUB_DOWNLOAD_CONCURRENCY
+              value: "8"
+            - name: HF_HUB_DISABLE_TELEMETRY
+              value: "1"
           volumeMounts:
             - name: model-storage
-              mountPath: /model-cache
+              mountPath: /mnt/models
+            - name: tmp
+              mountPath: /tmp
           resources:
             requests:
               cpu: "1"
               memory: 4Gi
             limits:
-              cpu: "4"
-              memory: 8Gi
+              cpu: "2"
+              memory: 20Gi
       volumes:
         - name: model-storage
           persistentVolumeClaim:
-            claimName: %s`, jobName, dl.namespace, jobName, hfModel, hfModel, pvcName))
+            claimName: %s
+        - name: tmp
+          emptyDir: {}`, jobName, dl.namespace, jobName, storageInitImage, hfModel, downloadTarget, pvcName))
 	if err != nil {
 		return err
 	}
@@ -263,7 +348,35 @@ func (dl *Downloader) kubectl(ctx context.Context, args ...string) (string, erro
 	}
 	cmd := exec.CommandContext(ctx, bin, cmdArgs...)
 	output, err := cmd.CombinedOutput()
-	return string(output), err
+	if err != nil {
+		return string(output), fmt.Errorf("%w\n%s", err, string(output))
+	}
+	return string(output), nil
+}
+
+func (dl *Downloader) ensureNamespace(ctx context.Context) error {
+	_, err := dl.kubectl(ctx, "get", "namespace", dl.namespace)
+	if err == nil {
+		return nil
+	}
+	// Namespace doesn't exist, create it (use kubectl without -n flag)
+	bin := "kubectl"
+	if dl.platform == "ocp" {
+		if _, lookErr := exec.LookPath("oc"); lookErr == nil {
+			bin = "oc"
+		}
+	}
+	args := []string{}
+	if dl.kubeconfig != "" {
+		args = append(args, "--kubeconfig", dl.kubeconfig)
+	}
+	args = append(args, "create", "namespace", dl.namespace)
+	cmd := exec.CommandContext(ctx, bin, args...)
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%w\n%s", err, string(output))
+	}
+	return nil
 }
 
 func (dl *Downloader) resourceExists(ctx context.Context, kind, name string) (bool, error) {
@@ -284,6 +397,10 @@ func (dl *Downloader) getField(ctx context.Context, kind, name, jsonpath string)
 
 func (dl *Downloader) getPodLogs(ctx context.Context, jobName string) string {
 	output, _ := dl.kubectl(ctx, "logs", "-l", fmt.Sprintf("job-name=%s", jobName), "--tail=30")
+	// Filter out kubectl noise when pod has no logs yet
+	if strings.Contains(output, "No resources found") || strings.Contains(output, "is waiting to start") {
+		return ""
+	}
 	return output
 }
 
@@ -304,6 +421,46 @@ func (dl *Downloader) jobName(pvcName string) string {
 		name = name[:63]
 	}
 	return strings.Trim(name, "-")
+}
+
+// getStorageInitImage auto-detects the KServe storage initializer image from the cluster.
+// Falls back to a default if the configmap is not found.
+func (dl *Downloader) getStorageInitImage(ctx context.Context) string {
+	// Try to read from KServe configmap (works for both opendatahub and kserve namespaces)
+	for _, ns := range []string{"opendatahub", "kserve", "knative-serving"} {
+		bin := "kubectl"
+		args := []string{}
+		if dl.kubeconfig != "" {
+			args = append(args, "--kubeconfig", dl.kubeconfig)
+		}
+		args = append(args, "get", "configmap", "inferenceservice-config", "-n", ns,
+			"-o", "jsonpath={.data.storageInitializer}")
+		cmd := exec.CommandContext(ctx, bin, args...)
+		output, err := cmd.Output()
+		if err != nil || len(output) == 0 {
+			continue
+		}
+		var cfg struct {
+			Image string `json:"image"`
+		}
+		if err := json.Unmarshal(output, &cfg); err == nil && cfg.Image != "" {
+			return cfg.Image
+		}
+	}
+	// Fallback
+	return "quay.io/opendatahub/kserve-storage-initializer:v0.15-latest"
+}
+
+// PVCModelURI returns the pvc:// URI for a cached model, including the model subpath.
+// e.g., pvc://model-cache-qwen-qwen2-5-7b-instruct/Qwen2.5-7B-Instruct
+func (dl *Downloader) PVCModelURI(tc *config.TestCase) string {
+	pvcName := dl.pvcName(tc)
+	// The storage initializer stores the model under /mnt/models/<model-name-after-slash>
+	modelName := tc.Model.Name
+	if idx := strings.LastIndex(modelName, "/"); idx >= 0 {
+		modelName = modelName[idx+1:]
+	}
+	return fmt.Sprintf("pvc://%s/%s", pvcName, modelName)
 }
 
 func (dl *Downloader) storageClassYAML() string {

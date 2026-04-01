@@ -1,10 +1,9 @@
 name: smoke
-description: "Quick smoke test - CPU-only models, no GPU required. Use this to verify the framework works."
+description: "Quick smoke test - single GPU model to verify the framework works"
 platform: any
 labels:
   - smoke
 testCases:
-  - opt-125m-cpu
-  - cache-aware-sim-cpu
+  - qwen2-7b-gpu
 parallel: false
-timeout: 15m
+timeout: 30m

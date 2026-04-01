@@ -9,7 +9,7 @@
 *.test
 
 # Output
-reports/*.json
+reports/
 
 # Go
 vendor/

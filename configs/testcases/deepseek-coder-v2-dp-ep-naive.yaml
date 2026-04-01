@@ -1,5 +1,5 @@
 name: deepseek-coder-v2-dp-ep-naive
-description: "DeepSeek-Coder-V2-Lite with data/expert parallelism (naive backend, no RDMA)"
+description: "8 GPUs - DeepSeek-Coder-V2 DP=16 + EP (naive, no RDMA)"
 labels:
   - gpu
   - deepseek
@@ -17,7 +17,7 @@ model:
     keepPVC: true
     timeout: 120m
 deployment:
-  manifestPath: deploy/manifests/deepseek-coder-v2-dp-ep-naive.yaml
+  manifestPath: deepseek-coder-v2-dp-ep-naive.yaml
   replicas: 1
   serviceAccount: hfsa
   readyTimeout: 90m

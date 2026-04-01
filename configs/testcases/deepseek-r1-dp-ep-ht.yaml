@@ -1,5 +1,5 @@
 name: deepseek-r1-dp-ep-ht
-description: "DeepSeek-R1-0528 with data/expert parallelism (high throughput, RDMA/RoCE)"
+description: "8 GPUs - DeepSeek-R1 DP=32 + EP (high-throughput, RDMA/RoCE)"
 labels:
   - gpu
   - deepseek
@@ -17,7 +17,7 @@ model:
     storageSize: 500Gi
     keepPVC: true
 deployment:
-  manifestPath: deploy/manifests/deepseek-r1-dp-ep-ht.yaml
+  manifestPath: deepseek-r1-dp-ep-ht.yaml
   replicas: 1
   serviceAccount: hfsa
   readyTimeout: 90m

@@ -6,10 +6,12 @@ spec:
   model:
     uri: hf://Qwen/Qwen2.5-7B-Instruct
     name: Qwen/Qwen2.5-7B-Instruct
-  replicas: 3
+  replicas: 1
   router:
     route: {}
   template:
+    imagePullSecrets:
+    - name: redhat-pull-secret
     containers:
       - name: main
         resources:
