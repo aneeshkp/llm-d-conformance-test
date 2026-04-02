@@ -14,7 +14,7 @@ type Options struct {
 	Name     string
 }
 
-// UntilSuccess retries fn until it succeeds, the context is cancelled, or the timeout is reached.
+// UntilSuccess retries fn until it succeeds, the context is canceled, or the timeout is reached.
 func UntilSuccess(ctx context.Context, opts Options, fn func() error) error {
 	if opts.Timeout == 0 {
 		opts.Timeout = 5 * time.Minute

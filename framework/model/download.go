@@ -16,21 +16,25 @@ import (
 
 // Downloader manages model downloads using kubectl apply with inline manifests.
 type Downloader struct {
-	kubeconfig   string
-	namespace    string
-	storageClass string
-	platform     string
+	kubeconfig          string
+	namespace           string
+	storageClass        string
+	storageSizeOverride string // if set, overrides test case config
+	platform            string
+	modelSource         string // "pvc" (flat layout) or "pvc-snapshot" (HF cache layout)
 	// LogFunc is called with progress messages during download. If nil, progress is silent.
 	LogFunc func(format string, args ...interface{})
 }
 
 // NewDownloader creates a Downloader.
-func NewDownloader(kubeconfig, namespace, storageClass, platform string) *Downloader {
+func NewDownloader(kubeconfig, namespace, storageClass, storageSize, platform, modelSource string) *Downloader {
 	return &Downloader{
-		kubeconfig:   kubeconfig,
-		namespace:    namespace,
-		storageClass: storageClass,
-		platform:     platform,
+		kubeconfig:          kubeconfig,
+		namespace:           namespace,
+		storageClass:        storageClass,
+		storageSizeOverride: storageSize,
+		platform:            platform,
+		modelSource:         modelSource,
 	}
 }
 
@@ -62,7 +66,7 @@ func (dl *Downloader) DownloadModel(ctx context.Context, tc *config.TestCase) *C
 		ok, err := dl.resourceExists(ctx, "pvc", existingPVC)
 		if err != nil || !ok {
 			result.Status = CacheStatusNotFound
-			result.Error = fmt.Errorf("PVC %s not found: %v", existingPVC, err)
+			result.Error = fmt.Errorf("PVC %s not found: %w", existingPVC, err)
 			result.Duration = time.Since(start)
 			return result
 		}
@@ -207,29 +211,37 @@ func (dl *Downloader) DownloadModel(ctx context.Context, tc *config.TestCase) *C
 func (dl *Downloader) Cleanup(ctx context.Context, tc *config.TestCase) {
 	pvcName := dl.pvcName(tc)
 	jobName := dl.jobName(pvcName)
-	dl.kubectl(ctx, "delete", "job", jobName, "--ignore-not-found=true")
+	_, _ = dl.kubectl(ctx, "delete", "job", jobName, "--ignore-not-found=true")
 }
 
 // CleanupAll removes both the download job and the PVC.
 func (dl *Downloader) CleanupAll(ctx context.Context, tc *config.TestCase) {
 	pvcName := dl.pvcName(tc)
 	jobName := dl.jobName(pvcName)
-	dl.kubectl(ctx, "delete", "job", jobName, "--ignore-not-found=true")
-	dl.kubectl(ctx, "delete", "pvc", pvcName, "--ignore-not-found=true")
+	_, _ = dl.kubectl(ctx, "delete", "job", jobName, "--ignore-not-found=true")
+	_, _ = dl.kubectl(ctx, "delete", "pvc", pvcName, "--ignore-not-found=true")
 }
 
 func (dl *Downloader) createPVC(ctx context.Context, pvcName string, tc *config.TestCase) error {
 	storageSize := "50Gi"
-	if tc.Model.Cache != nil && tc.Model.Cache.StorageSize != "" {
+	switch {
+	case dl.storageSizeOverride != "":
+		storageSize = dl.storageSizeOverride
+	case tc.Model.Cache != nil && tc.Model.Cache.StorageSize != "":
 		storageSize = tc.Model.Cache.StorageSize
-	} else if tc.Deployment.Resources.GPUs >= 8 {
+	case tc.Deployment.Resources.GPUs >= 8:
 		storageSize = "500Gi"
-	} else if tc.Deployment.Resources.GPUs >= 1 {
+	case tc.Deployment.Resources.GPUs >= 1:
 		storageSize = "100Gi"
 	}
 
-	// Use ReadWriteOnce by default — ReadWriteMany requires a storage class that supports it.
-	// For multi-replica models, the operator handles volume sharing.
+	// Use ReadWriteOnce by default (works with Azure Disk).
+	// Use ReadWriteMany when a RWX-capable StorageClass is explicitly provided.
+	accessMode := "ReadWriteOnce"
+	if dl.storageClass != "" && dl.storageClass != "default" && dl.storageClass != "managed-csi" {
+		accessMode = "ReadWriteMany"
+	}
+
 	tmpFile, err := dl.writeTempYAML(fmt.Sprintf(`apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -240,36 +252,41 @@ metadata:
     app.kubernetes.io/component: model-cache
 spec:
   accessModes:
-    - ReadWriteOnce
+    - %s
   resources:
     requests:
-      storage: %s%s`, pvcName, dl.namespace, storageSize, dl.storageClassYAML()))
+      storage: %s%s`, pvcName, dl.namespace, accessMode, storageSize, dl.storageClassYAML()))
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmpFile)
+	defer func() { _ = os.Remove(tmpFile) }()
 
 	_, err = dl.kubectl(ctx, "apply", "-f", tmpFile)
 	return err
 }
 
 func (dl *Downloader) createDownloadJob(ctx context.Context, pvcName string, tc *config.TestCase) error {
+	if dl.modelSource == "pvc-snapshot" {
+		return dl.createSnapshotDownloadJob(ctx, pvcName, tc)
+	}
+	return dl.createFlatDownloadJob(ctx, pvcName, tc)
+}
+
+// createFlatDownloadJob downloads model to a flat layout at /mnt/models/<ModelName>/
+// Used with pvc://<name>/<subpath> URIs — KServe mounts subpath at /mnt/models.
+func (dl *Downloader) createFlatDownloadJob(ctx context.Context, pvcName string, tc *config.TestCase) error {
 	hfModel := strings.TrimPrefix(tc.Model.URI, "hf://")
 	jobName := dl.jobName(pvcName)
 
-	// Use the storage initializer image from the cluster's KServe config.
 	storageInitImage := dl.getStorageInitImage(ctx)
 	dl.logProgress("[%s] Using storage initializer image: %s", tc.Name, storageInitImage)
 
-	// KServe mounts pvc://<name>/<subpath> at /mnt/models with subPath=<subpath>.
-	// So the download must place model files under /mnt/models/<subpath>/ on the PVC.
-	// e.g., pvc://pvc-name/Qwen2.5-7B-Instruct → download to /mnt/models/Qwen2.5-7B-Instruct
 	modelSubdir := hfModel
 	if idx := strings.LastIndex(hfModel, "/"); idx >= 0 {
 		modelSubdir = hfModel[idx+1:]
 	}
 	downloadTarget := fmt.Sprintf("/mnt/models/%s", modelSubdir)
-	dl.logProgress("[%s] Download target: %s", tc.Name, downloadTarget)
+	dl.logProgress("[%s] Download target: %s (flat layout)", tc.Name, downloadTarget)
 
 	tmpFile, err := dl.writeTempYAML(fmt.Sprintf(`apiVersion: batch/v1
 kind: Job
@@ -326,7 +343,82 @@ spec:
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmpFile)
+	defer func() { _ = os.Remove(tmpFile) }()
+
+	_, err = dl.kubectl(ctx, "apply", "-f", tmpFile)
+	return err
+}
+
+// createSnapshotDownloadJob downloads model using HF cache/snapshot layout on PVC.
+// Sets HF_HUB_CACHE=/mnt/models so snapshot_download() uses the HF cache directory structure.
+// After download, the model lives at: /mnt/models/models--Org--Model/snapshots/<hash>/
+// The manifest uses pvc://pvc-name/models--Org--Model/snapshots/<hash> as subpath (Workaround A).
+func (dl *Downloader) createSnapshotDownloadJob(ctx context.Context, pvcName string, tc *config.TestCase) error {
+	hfModel := strings.TrimPrefix(tc.Model.URI, "hf://")
+	jobName := dl.jobName(pvcName)
+
+	storageInitImage := dl.getStorageInitImage(ctx)
+	dl.logProgress("[%s] Using storage initializer image: %s", tc.Name, storageInitImage)
+	dl.logProgress("[%s] Download target: /mnt/models (HF snapshot/cache layout)", tc.Name)
+
+	// Download using snapshot_download() without local_dir — HF_HUB_CACHE controls location.
+	tmpFile, err := dl.writeTempYAML(fmt.Sprintf(`apiVersion: batch/v1
+kind: Job
+metadata:
+  name: %s
+  namespace: %s
+  labels:
+    app.kubernetes.io/managed-by: llm-d-conformance-test
+    app.kubernetes.io/component: model-download
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      labels:
+        job-name: %s
+    spec:
+      restartPolicy: OnFailure
+      securityContext:
+        fsGroup: 1000
+      containers:
+        - name: storage-initializer
+          image: %s
+          command:
+            - python3
+            - -c
+            - "from huggingface_hub import snapshot_download; snapshot_download(repo_id='%s')"
+          env:
+            - name: HF_HUB_CACHE
+              value: /mnt/models
+            - name: HF_HUB_ENABLE_HF_TRANSFER
+              value: "1"
+            - name: HF_HUB_DOWNLOAD_CONCURRENCY
+              value: "8"
+            - name: HF_HUB_DISABLE_TELEMETRY
+              value: "1"
+          volumeMounts:
+            - name: model-storage
+              mountPath: /mnt/models
+            - name: tmp
+              mountPath: /tmp
+          resources:
+            requests:
+              cpu: "1"
+              memory: 4Gi
+            limits:
+              cpu: "2"
+              memory: 20Gi
+      volumes:
+        - name: model-storage
+          persistentVolumeClaim:
+            claimName: %s
+        - name: tmp
+          emptyDir: {}`, jobName, dl.namespace, jobName, storageInitImage, hfModel, pvcName))
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.Remove(tmpFile) }()
 
 	_, err = dl.kubectl(ctx, "apply", "-f", tmpFile)
 	return err
@@ -412,7 +504,11 @@ func (dl *Downloader) pvcName(tc *config.TestCase) string {
 	if len(name) > 50 {
 		name = name[:50]
 	}
-	return "model-cache-" + strings.Trim(name, "-")
+	prefix := "model-cache-"
+	if dl.modelSource == "pvc-snapshot" {
+		prefix = "model-snapshot-"
+	}
+	return prefix + strings.Trim(name, "-")
 }
 
 func (dl *Downloader) jobName(pvcName string) string {
@@ -451,16 +547,69 @@ func (dl *Downloader) getStorageInitImage(ctx context.Context) string {
 	return "quay.io/opendatahub/kserve-storage-initializer:v0.15-latest"
 }
 
-// PVCModelURI returns the pvc:// URI for a cached model, including the model subpath.
-// e.g., pvc://model-cache-qwen-qwen2-5-7b-instruct/Qwen2.5-7B-Instruct
+// PVCModelURI returns the pvc:// URI for a cached model.
+// For flat layout: pvc://pvc-name/Qwen2.5-7B-Instruct (with subpath)
+// For snapshot layout: pvc://pvc-name (no subpath — vLLM resolves via HF_HUB_CACHE + --model flag)
 func (dl *Downloader) PVCModelURI(tc *config.TestCase) string {
 	pvcName := dl.pvcName(tc)
-	// The storage initializer stores the model under /mnt/models/<model-name-after-slash>
+	if dl.modelSource == "pvc-snapshot" {
+		return fmt.Sprintf("pvc://%s", pvcName)
+	}
 	modelName := tc.Model.Name
 	if idx := strings.LastIndex(modelName, "/"); idx >= 0 {
 		modelName = modelName[idx+1:]
 	}
 	return fmt.Sprintf("pvc://%s/%s", pvcName, modelName)
+}
+
+// ResolveSnapshotPath finds the snapshot subpath on the PVC for HF cache layout.
+// Returns e.g. "models--Qwen--Qwen2.5-7B-Instruct/snapshots/74c44f17ba..."
+func (dl *Downloader) ResolveSnapshotPath(ctx context.Context, tc *config.TestCase) (string, error) {
+	pvcName := dl.pvcName(tc)
+	modelCacheDir := "models--" + strings.ReplaceAll(tc.Model.Name, "/", "--")
+
+	// Read refs/main from the PVC to get the snapshot hash
+	// Use a one-shot pod since we can't exec into the download job (it's completed)
+	checkName := "snapshot-ref-" + pvcName
+	if len(checkName) > 63 {
+		checkName = checkName[:63]
+	}
+	refsPath := fmt.Sprintf("/mnt/models/%s/refs/main", modelCacheDir)
+
+	// Delete any leftover check pod from a previous run
+	_, _ = dl.kubectl(ctx, "delete", "pod", checkName, "--ignore-not-found=true")
+
+	out, err := dl.kubectl(ctx, "run", checkName, "--rm", "-i", "--restart=Never",
+		"--image=busybox",
+		"--overrides", fmt.Sprintf(`{"spec":{"containers":[{"name":"check","image":"busybox","command":["cat","%s"],"volumeMounts":[{"name":"pvc","mountPath":"/mnt/models"}]}],"volumes":[{"name":"pvc","persistentVolumeClaim":{"claimName":"%s"}}]}}`, refsPath, pvcName)) //nolint:gocritic // JSON template requires literal quotes
+	if err != nil {
+		return "", fmt.Errorf("could not read snapshot ref: %w\n%s", err, out)
+	}
+
+	// Extract the commit hash — a 40-char hex string.
+	// kubectl run --rm -i merges stdout/stderr, so the hash may be glued to
+	// noise like 'pod "..." deleted'. We scan for any hex substring >= 20 chars.
+	hash := ""
+	current := strings.Builder{}
+	for _, ch := range out {
+		if (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F') {
+			current.WriteRune(ch)
+		} else {
+			if current.Len() >= 20 {
+				hash = current.String()
+				break
+			}
+			current.Reset()
+		}
+	}
+	if hash == "" && current.Len() >= 20 {
+		hash = current.String()
+	}
+	if hash == "" {
+		return "", fmt.Errorf("could not find snapshot hash in refs/main output: %q", out)
+	}
+
+	return fmt.Sprintf("%s/snapshots/%s", modelCacheDir, hash), nil
 }
 
 func (dl *Downloader) storageClassYAML() string {
@@ -478,10 +627,10 @@ func (dl *Downloader) writeTempYAML(content string) (string, error) {
 	}
 	path := f.Name()
 	if _, err := f.WriteString(content); err != nil {
-		f.Close()
-		os.Remove(path)
+		_ = f.Close()
+		_ = os.Remove(path)
 		return "", fmt.Errorf("writing temp file: %w", err)
 	}
-	f.Close()
+	_ = f.Close()
 	return filepath.Clean(path), nil
 }

@@ -1,23 +1,18 @@
-name: qwen2-7b-gpu-no-scheduler
-description: "1 GPU - Qwen2.5-7B without scheduler, K8s native routing"
-labels:
-  - gpu
-  - single-node-gpu
-  - qwen2
-  - no-scheduler
+name: single-gpu
+description: "1 GPU with scheduler (default: Qwen/Qwen3-0.6B)"
 model:
-  name: Qwen/Qwen2.5-7B-Instruct
-  uri: hf://Qwen/Qwen2.5-7B-Instruct
-  displayName: qwen2-7b-instruct-single-no-scheduler
+  name: Qwen/Qwen3-0.6B
+  uri: hf://Qwen/Qwen3-0.6B
+  displayName: qwen3-0.6b-single-gpu
   category: single-node-gpu
   cache:
     enabled: true
-    storageSize: 100Gi
+    storageSize: 10Gi
     keepPVC: true
-    timeout: 60m
+    timeout: 15m
 deployment:
-  manifestPath: qwen2-7b-gpu-no-scheduler.yaml
-  replicas: 3
+  manifestPath: single-gpu.yaml
+  replicas: 1
   readyTimeout: 15m
   resources:
     cpu: "4"
@@ -31,8 +26,14 @@ validation:
   inferenceCheck: true
   testPrompts:
     - "What is Kubernetes?"
+    - "Explain containerization."
   expectedCodes: [200]
   timeout: 2m
   retryAttempts: 3
   retryInterval: 15s
+  metricsCheck:
+    enabled: true
+    checkVLLM: true
+    checkEPP: true
+    checkScheduler: true
 cleanup: true

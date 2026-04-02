@@ -1,10 +1,7 @@
-name: deepseek
-description: "DeepSeek MoE models with data/expert parallelism - requires 8 GPUs + RDMA"
+name: moe
+description: "MoE with DP/EP — requires 8 GPUs + RDMA/RoCE"
 platform: any
-labels:
-  - deepseek
 testCases:
-  - deepseek-r1-dp-ep-ht
-  - deepseek-coder-v2-dp-ep-naive
+  - moe
 parallel: false
 timeout: 180m
