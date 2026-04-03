@@ -1,14 +1,16 @@
 apiVersion: serving.kserve.io/v1alpha1
 kind: LLMInferenceService
 metadata:
-  name: qwen2-7b-instruct-single-no-scheduler
+  name: single-gpu
 spec:
   model:
-    uri: hf://Qwen/Qwen2.5-7B-Instruct
-    name: Qwen/Qwen2.5-7B-Instruct
+    uri: hf://Qwen/Qwen3-0.6B
+    name: Qwen/Qwen3-0.6B
   replicas: 1
   router:
+    scheduler: {}
     route: {}
+    gateway: {}
   template:
     imagePullSecrets:
     - name: redhat-pull-secret
