@@ -293,23 +293,28 @@ func (d *Deployer) CleanupNamespace(ctx context.Context, namespace string) error
 }
 
 // GetServiceEndpoint returns the inference service URL.
+// Tries the specific LLMInferenceService name first, then falls back to any in the namespace.
 func (d *Deployer) GetServiceEndpoint(ctx context.Context, tc *config.TestCase) (string, error) {
 	ns := d.resolveNamespace(tc)
-	name := ExtractLLMISVCName(tc)
 
+	// Try specific name first, fall back to any llmisvc in the namespace
+	name := ExtractLLMISVCName(tc)
 	output, err := d.Kubectl(ctx, "get", "llmisvc", name, "-n", ns, "-o", "jsonpath={.status.url}")
+	if err != nil || strings.TrimSpace(output) == "" {
+		output, err = d.Kubectl(ctx, "get", "llmisvc", "-n", ns, "-o", "jsonpath={.items[0].status.url}")
+	}
 	if err != nil {
 		return "", fmt.Errorf("getting service endpoint: %w", err)
 	}
 
 	url := strings.TrimSpace(output)
 	if url == "" {
-		// Fallback: try to get the service ClusterIP
+		// Fallback: try to get any service ClusterIP in the namespace
 		svcOutput, err := d.Kubectl(ctx, "get", "svc", "-n", ns, "-l",
-			fmt.Sprintf("app.kubernetes.io/name=%s", name),
+			"app.kubernetes.io/part-of=llminferenceservice",
 			"-o", "jsonpath={.items[0].spec.clusterIP}")
 		if err != nil || strings.TrimSpace(svcOutput) == "" {
-			return "", fmt.Errorf("no endpoint found for llmisvc %s", name)
+			return "", fmt.Errorf("no endpoint found for any llmisvc in namespace %s", ns)
 		}
 		port := tc.Validation.HealthPort
 		if port == 0 {
@@ -371,6 +376,41 @@ func (d *Deployer) GetPlatformInfo(ctx context.Context) map[string]string {
 			"-o", "jsonpath={.data.storageInitializer}")
 		if err == nil && strings.TrimSpace(output) != "" {
 			info["storageInitializerConfig"] = strings.TrimSpace(output)
+			break
+		}
+	}
+
+	return info
+}
+
+// GetVLLMVersion gets the vLLM image and version from a running pod in the namespace.
+func (d *Deployer) GetVLLMVersion(ctx context.Context) map[string]string {
+	info := make(map[string]string)
+
+	// Get pod name
+	podName, err := d.Kubectl(ctx, "get", "pods", "-n", d.Namespace, "-l",
+		"app.kubernetes.io/component=llminferenceservice-workload",
+		"-o", "jsonpath={.items[0].metadata.name}")
+	pod := strings.TrimSpace(podName)
+	if err != nil || pod == "" {
+		return info
+	}
+
+	// Get image
+	img, _ := d.Kubectl(ctx, "get", "pod", pod, "-n", d.Namespace,
+		"-o", "jsonpath={.spec.containers[?(@.name=='main')].image}")
+	if img = strings.TrimSpace(img); img != "" {
+		info["vllmImage"] = img
+	}
+
+	// Get actual vLLM version from inside the pod
+	ver, _ := d.Kubectl(ctx, "exec", pod, "-n", d.Namespace, "-c", "main",
+		"--", "python3", "-c", "import vllm; print(vllm.__version__)")
+	for _, line := range strings.Split(ver, "\n") {
+		line = strings.TrimSpace(line)
+		// Version string is like "0.8.5" or "0.8.5.post1" — starts with a digit, no spaces
+		if line != "" && len(line) < 30 && line[0] >= '0' && line[0] <= '9' && !strings.Contains(line, " ") {
+			info["vllmVersion"] = line
 			break
 		}
 	}

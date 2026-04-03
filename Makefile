@@ -19,6 +19,7 @@ ENDPOINT ?=
 MODEL_SOURCE ?= hf
 MODEL ?=
 NO_CLEANUP ?=
+DISCOVER ?=
 
 # Build flags
 GO_TEST_FLAGS ?= -v
@@ -53,6 +54,9 @@ endif
 ifdef NO_CLEANUP
   TEST_FLAGS += -nocleanup
 endif
+ifdef DISCOVER
+  TEST_FLAGS += -mode=discover
+endif
 
 .PHONY: help
 help: ## Show this help
@@ -73,6 +77,8 @@ help: ## Show this help
 	@printf '  \033[33m%-25s\033[0m %s\n' "" "make setup MANIFEST_REPO=https://github.com/myorg/manifests.git"
 	@printf '  \033[36m%-25s\033[0m %s\n' "NO_CLEANUP" "Keep resources after test for debugging"
 	@printf '  \033[33m%-25s\033[0m %s\n' "" "make test TESTCASE=single-gpu NO_CLEANUP=1"
+	@printf '  \033[36m%-25s\033[0m %s\n' "DISCOVER" "Validate existing deployment (skip deploy/cleanup)"
+	@printf '  \033[33m%-25s\033[0m %s\n' "" "make test TESTCASE=single-gpu DISCOVER=true NAMESPACE=my-ns"
 	@printf '  \033[36m%-25s\033[0m %s\n' "STORAGE_CLASS" "StorageClass for PVCs (default: cluster default)"
 	@printf '  \033[33m%-25s\033[0m %s\n' "" "make cache-model TESTCASE=single-gpu STORAGE_CLASS=azurefile-rwx"
 	@printf '  \033[36m%-25s\033[0m %s\n' "STORAGE_SIZE" "Override PVC storage size (default: from test case config)"
@@ -240,6 +246,9 @@ profiles: ## List available test profiles
 	@echo "  make test-profile-all MODEL=Qwen/Qwen2.5-7B-Instruct"
 	@echo "  make test-profile-all MODEL_SOURCE=pvc"
 	@echo "  make test-profile-smoke NO_CLEANUP=1"
+	@echo ""
+	@echo "Discover (validate existing deployment):"
+	@echo "  make test-profile-all DISCOVER=true NAMESPACE=my-ns"
 
 .PHONY: testcases
 testcases: ## List available test cases grouped by category
@@ -276,6 +285,9 @@ testcases: ## List available test cases grouped by category
 	@echo "  make test TESTCASE=single-gpu"
 	@echo "  make test TESTCASE=single-gpu MODEL=Qwen/Qwen2.5-7B-Instruct"
 	@echo "  make test TESTCASE=cache-aware NO_CLEANUP=1"
+	@echo ""
+	@echo "Discover (validate existing deployment):"
+	@echo "  make test TESTCASE=single-gpu DISCOVER=true NAMESPACE=my-ns"
 	@echo ""
 
 .PHONY: models

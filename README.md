@@ -135,6 +135,15 @@ make test TESTCASE=single-gpu MODEL_SOURCE=pvc
 make cache-model TESTCASE=single-gpu STORAGE_CLASS=azurefile-rwx STORAGE_SIZE=50Gi
 ```
 
+## Discover Mode
+
+Validate an already-running LLMInferenceService — skips deploy and cleanup:
+
+```bash
+make test TESTCASE=single-gpu DISCOVER=true NAMESPACE=my-ns
+make test-profile-all DISCOVER=true NAMESPACE=my-ns
+```
+
 ## Configuration
 
 ### Flags
@@ -146,6 +155,7 @@ make cache-model TESTCASE=single-gpu STORAGE_CLASS=azurefile-rwx STORAGE_SIZE=50
 | `MODEL_SOURCE` | `hf` | `hf` (HuggingFace direct) or `pvc` (pre-cached) |
 | `MANIFEST_REF` | `main` | Manifest repo branch (e.g., `3.4-ea1`, `3.4-ea2`) |
 | `NO_CLEANUP` | — | Set to `1` to keep resources after test |
+| `DISCOVER` | — | Set to `true` to validate existing deployment (skip deploy/cleanup) |
 | `STORAGE_CLASS` | cluster default | StorageClass for PVCs |
 | `STORAGE_SIZE` | from test case config | Override PVC storage size (e.g., `50Gi`) |
 | `NAMESPACE` | `llm-conformance-test` | Target K8s namespace |

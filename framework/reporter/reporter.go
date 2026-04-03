@@ -95,6 +95,16 @@ func (r *Reporter) SetEnvironment(env EnvironmentInfo) {
 	r.report.Environment = env
 }
 
+// UpdateExtra adds or updates a key in the environment extra map.
+func (r *Reporter) UpdateExtra(key, value string) {
+	if r.report.Environment.Extra == nil {
+		r.report.Environment.Extra = make(map[string]string)
+	}
+	if _, exists := r.report.Environment.Extra[key]; !exists {
+		r.report.Environment.Extra[key] = value
+	}
+}
+
 // AddResult appends a test result.
 func (r *Reporter) AddResult(result TestResult) {
 	r.report.Results = append(r.report.Results, result)
