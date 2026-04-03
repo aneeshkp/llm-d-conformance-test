@@ -1,23 +1,16 @@
-name: deepseek-r1-dp-ep-ht
-description: "8 GPUs - DeepSeek-R1 DP=32 + EP (high-throughput, RDMA/RoCE)"
-labels:
-  - gpu
-  - deepseek
-  - moe
-  - dp-ep
-  - multi-node
+name: moe
+description: "MoE with DP/EP, 8 GPUs, RDMA/RoCE (default: deepseek-ai/DeepSeek-R1-0528)"
 model:
   name: deepseek-ai/DeepSeek-R1-0528
-  uri: pvc://llm-test-pvc-deepseek
+  uri: hf://deepseek-ai/DeepSeek-R1-0528
   displayName: deepseek-r1-0528
   category: deepseek
   cache:
-    enabled: true           # will verify PVC exists since uri is pvc://
-    pvcName: llm-test-pvc-deepseek
+    enabled: true
     storageSize: 500Gi
     keepPVC: true
 deployment:
-  manifestPath: deepseek-r1-dp-ep-ht.yaml
+  manifestPath: moe.yaml
   replicas: 1
   serviceAccount: hfsa
   readyTimeout: 90m

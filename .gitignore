@@ -11,6 +11,9 @@
 # Output
 reports/
 
+# Manifests (fetched from external repo at runtime)
+deploy/manifests/
+
 # Go
 vendor/
 

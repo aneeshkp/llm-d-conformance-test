@@ -25,7 +25,7 @@ func New(baseURL string) *LLMClient {
 		HTTPClient: &http.Client{
 			Timeout: 120 * time.Second,
 			Transport: &http.Transport{
-				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true}, //nolint:gosec // G402: intentional skip for self-signed vLLM TLS certs
 			},
 		},
 	}
@@ -42,7 +42,7 @@ func (c *LLMClient) HealthCheck(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("health check request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -163,7 +163,7 @@ func (c *LLMClient) ListModels(ctx context.Context) (*ModelsResponse, error) {
 	if err != nil {
 		return nil, fmt.Errorf("models request failed: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
@@ -180,7 +180,7 @@ func (c *LLMClient) ListModels(ctx context.Context) (*ModelsResponse, error) {
 func (c *LLMClient) post(ctx context.Context, path string, reqBody, respBody interface{}) error {
 	jsonBody, err := json.Marshal(reqBody)
 	if err != nil {
-		return fmt.Errorf("marshalling request: %w", err)
+		return fmt.Errorf("marshaling request: %w", err)
 	}
 
 	url := c.BaseURL + path
@@ -194,7 +194,7 @@ func (c *LLMClient) post(ctx context.Context, path string, reqBody, respBody int
 	if err != nil {
 		return fmt.Errorf("request to %s failed: %w", path, err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {

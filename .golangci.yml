@@ -1,0 +1,36 @@
+version: "2"
+
+run:
+  go: "1.24"
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - errorlint
+    - gocritic
+    - gosec
+    - misspell
+    - prealloc
+    - unconvert
+    - unparam
+    - whitespace
+  settings:
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+      disabled-checks:
+        - commentFormatting
+        - hugeParam
+    gosec:
+      excludes:
+        - G101
+        - G204
+        - G304
+    misspell:
+      locale: US
+
+issues:
+  max-issues-per-linter: 50
+  max-same-issues: 5

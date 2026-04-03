@@ -1,10 +1,7 @@
 name: cache-aware
-description: "KV cache-aware routing tests - simulator (CPU) and real GPU variants"
+description: "KV cache-aware routing tests"
 platform: any
-labels:
-  - cache-aware
 testCases:
-  - cache-aware-sim-cpu
-  - cache-aware-qwen2-7b-gpu
+  - cache-aware
 parallel: false
 timeout: 30m

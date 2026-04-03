@@ -80,46 +80,35 @@ var _ = Describe("Framework Smoke Tests", func() {
 	})
 
 	Context("Config Filtering", func() {
-		It("should filter test cases by label", func() {
-			testCaseDir := findTestCaseDir()
-			allCases, err := config.LoadTestCasesFromDir(testCaseDir)
-			Expect(err).NotTo(HaveOccurred())
-
-			gpuCases := config.FilterTestCasesByLabels(allCases, []string{"gpu"})
-			Expect(gpuCases).NotTo(BeEmpty(), "Expected GPU test cases")
-			for _, tc := range gpuCases {
-				Expect(tc.Deployment.Resources.GPUs).To(BeNumerically(">", 0),
-					"GPU-labeled test case %s should have >0 GPUs", tc.Name)
-			}
-		})
-
 		It("should filter test cases by name", func() {
 			testCaseDir := findTestCaseDir()
 			allCases, err := config.LoadTestCasesFromDir(testCaseDir)
 			Expect(err).NotTo(HaveOccurred())
 
-			filtered := config.FilterTestCasesByNames(allCases, []string{"qwen2-7b-gpu"})
+			filtered := config.FilterTestCasesByNames(allCases, []string{"single-gpu"})
 			Expect(filtered).To(HaveLen(1))
-			Expect(filtered[0].Name).To(Equal("qwen2-7b-gpu"))
+			Expect(filtered[0].Name).To(Equal("single-gpu"))
 		})
 	})
 
 	Context("Manifest Validation", func() {
 		It("should have manifests that exist on disk for all test cases", func() {
+			rootDir := findRootDir()
+			manifestDir := filepath.Join(rootDir, "deploy", "manifests")
+			if _, err := os.Stat(manifestDir); os.IsNotExist(err) {
+				Skip("deploy/manifests/ not found — run 'make setup' to clone manifest repo")
+			}
+
 			testCaseDir := findTestCaseDir()
 			cases, err := config.LoadTestCasesFromDir(testCaseDir)
 			Expect(err).NotTo(HaveOccurred())
 
-			rootDir := findRootDir()
 			for _, tc := range cases {
-				// Check both hf/ and pvc/ variants exist
-				for _, variant := range []string{"hf", "pvc"} {
-					manifestPath := filepath.Join(rootDir, "deploy", "manifests", variant, tc.Deployment.ManifestPath)
-					_, err := os.Stat(manifestPath)
-					Expect(err).NotTo(HaveOccurred(),
-						"Manifest %s/%s for test case %s does not exist", variant, tc.Deployment.ManifestPath, tc.Name)
-				}
-				GinkgoWriter.Printf("  Verified manifest (hf + pvc): %s\n", tc.Deployment.ManifestPath)
+				manifestPath := filepath.Join(manifestDir, tc.Deployment.ManifestPath)
+				_, err := os.Stat(manifestPath)
+				Expect(err).NotTo(HaveOccurred(),
+					"Manifest %s for test case %s does not exist — run 'make setup'", tc.Deployment.ManifestPath, tc.Name)
+				GinkgoWriter.Printf("  Verified manifest: %s\n", tc.Deployment.ManifestPath)
 			}
 		})
 	})
@@ -128,7 +117,7 @@ var _ = Describe("Framework Smoke Tests", func() {
 		It("should generate a valid JSON report", func() {
 			tmpDir, err := os.MkdirTemp("", "llm-d-test-report-*")
 			Expect(err).NotTo(HaveOccurred())
-			defer os.RemoveAll(tmpDir)
+			defer func() { _ = os.RemoveAll(tmpDir) }()
 
 			rep := reporter.New(tmpDir, "smoke-test", "smoke", "any")
 			rep.SetEnvironment(reporter.EnvironmentInfo{

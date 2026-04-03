@@ -25,9 +25,10 @@ const (
 
 // Deployer manages deployment of LLMInferenceService resources on Kubernetes.
 type Deployer struct {
-	Kubeconfig string
-	Platform   Platform
-	Namespace  string
+	Kubeconfig  string
+	Platform    Platform
+	Namespace   string
+	ModelSource string // "pvc", "hf", or "pvc-snapshot"
 	// LogFunc is called with progress messages. If nil, progress is silent.
 	LogFunc func(format string, args ...interface{})
 }
@@ -89,14 +90,25 @@ func (d *Deployer) Deploy(ctx context.Context, tc *config.TestCase) *DeployResul
 		return result
 	}
 
-	output, err := d.Kubectl(ctx, "apply", "-n", ns, "-f", manifestPath)
+	// Patch the manifest with the correct model URI and name from test case config.
+	// This allows one manifest to work with both hf:// and pvc:// sources.
+	patchedPath, err := d.patchManifest(manifestPath, tc)
+	if err != nil {
+		result.Error = fmt.Errorf("patching manifest: %w", err)
+		result.Duration = time.Since(start)
+		return result
+	}
+	if patchedPath != manifestPath {
+		defer func() { _ = os.Remove(patchedPath) }()
+	}
+
+	output, err := d.Kubectl(ctx, "apply", "-n", ns, "-f", patchedPath)
 	if err != nil {
 		result.Error = fmt.Errorf("applying manifest %s: %w\nOutput: %s", manifestPath, err, output)
 		result.Duration = time.Since(start)
 		return result
 	}
-	result.Logs = append(result.Logs, fmt.Sprintf("Applied manifest: %s", manifestPath))
-	result.Logs = append(result.Logs, output)
+	result.Logs = append(result.Logs, fmt.Sprintf("Applied manifest: %s", manifestPath), output)
 
 	result.Success = true
 	result.Duration = time.Since(start)
@@ -197,14 +209,6 @@ func (d *Deployer) WaitForReady(ctx context.Context, tc *config.TestCase) error 
 
 		return fmt.Errorf("llmisvc %s not ready (READY=%s, REASON=%s)", name, ready, reason)
 	})
-}
-
-func (d *Deployer) getField(ctx context.Context, kind, name, ns, jsonpath string) string {
-	output, err := d.Kubectl(ctx, "get", kind, name, "-n", ns, "-o", fmt.Sprintf("jsonpath=%s", jsonpath))
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(output)
 }
 
 // CheckResourceExists checks if a named Kubernetes resource exists in the namespace.
@@ -417,6 +421,53 @@ func (d *Deployer) runCommand(ctx context.Context, name string, args ...string) 
 	return string(output), err
 }
 
+// patchManifest reads a manifest, patches the model URI and name from the test case config,
+// and writes a temp file. This allows one manifest template to work with any model and source.
+func (d *Deployer) patchManifest(manifestPath string, tc *config.TestCase) (string, error) {
+	data, err := os.ReadFile(manifestPath)
+	if err != nil {
+		return "", fmt.Errorf("reading manifest %s: %w", manifestPath, err)
+	}
+
+	lines := strings.Split(string(data), "\n")
+	patched := false
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		// Patch uri: line
+		if strings.HasPrefix(trimmed, "uri:") && (strings.Contains(trimmed, "hf://") || strings.Contains(trimmed, "pvc://")) {
+			indent := line[:len(line)-len(strings.TrimLeft(line, " "))]
+			lines[i] = fmt.Sprintf("%suri: %s", indent, tc.Model.URI)
+			patched = true
+		}
+		// Patch name: line under model (the one after uri)
+		if strings.HasPrefix(trimmed, "name:") && i > 0 {
+			prevTrimmed := strings.TrimSpace(lines[i-1])
+			if strings.HasPrefix(prevTrimmed, "uri:") {
+				indent := line[:len(line)-len(strings.TrimLeft(line, " "))]
+				lines[i] = fmt.Sprintf("%sname: %s", indent, tc.Model.Name)
+				patched = true
+			}
+		}
+	}
+
+	if !patched {
+		return manifestPath, nil
+	}
+
+	tmpFile, err := os.CreateTemp("", "llmisvc-patched-*.yaml")
+	if err != nil {
+		return "", fmt.Errorf("creating temp manifest: %w", err)
+	}
+	if _, err := tmpFile.WriteString(strings.Join(lines, "\n")); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("writing patched manifest: %w", err)
+	}
+	_ = tmpFile.Close()
+	d.logProgress("  Patched manifest: uri=%s, name=%s", tc.Model.URI, tc.Model.Name)
+	return tmpFile.Name(), nil
+}
+
 func (d *Deployer) resolveNamespace(tc *config.TestCase) string {
 	if tc.Deployment.Namespace != "" {
 		return tc.Deployment.Namespace
@@ -427,9 +478,28 @@ func (d *Deployer) resolveNamespace(tc *config.TestCase) string {
 	return "llm-test"
 }
 
-// ExtractLLMISVCName extracts the LLMInferenceService name from the test case.
-// It derives it from the model display name or test case name.
+// ExtractLLMISVCName extracts the LLMInferenceService name from the manifest file.
+// Falls back to displayName or test case name if manifest can't be read.
 func ExtractLLMISVCName(tc *config.TestCase) string {
+	// Try to read metadata.name from the manifest file
+	if tc.Deployment.ManifestPath != "" {
+		data, err := os.ReadFile(tc.Deployment.ManifestPath)
+		if err == nil {
+			lines := strings.Split(string(data), "\n")
+			for i, line := range lines {
+				if strings.TrimSpace(line) == "metadata:" && i+1 < len(lines) {
+					next := strings.TrimSpace(lines[i+1])
+					if strings.HasPrefix(next, "name:") {
+						name := strings.TrimSpace(strings.TrimPrefix(next, "name:"))
+						name = strings.Trim(name, "\"'")
+						if name != "" {
+							return name
+						}
+					}
+				}
+			}
+		}
+	}
 	if tc.Model.DisplayName != "" {
 		return sanitizeK8sName(tc.Model.DisplayName)
 	}

@@ -21,11 +21,13 @@ var (
 	testCaseName string
 	labels       string
 	storageClass string
+	storageSize  string // override PVC storage size (e.g., "50Gi")
 	// Discover mode: validate an existing deployment without deploying
 	testMode    string
 	endpoint    string
-	modelSource string // "pvc" (default) or "hf"
-	noCleanup   bool
+	modelSource   string // "pvc" (default) or "hf"
+	modelOverride string // override model repo ID (e.g., "Qwen/Qwen3-0.6B")
+	noCleanup     bool
 )
 
 func init() {
@@ -38,10 +40,12 @@ func init() {
 	flag.StringVar(&testCaseName, "testcase", "", "Run a single test case by name (overrides profile)")
 	flag.StringVar(&labels, "labels", "", "Comma-separated labels to filter test cases (overrides profile)")
 	flag.StringVar(&storageClass, "storage-class", "", "Kubernetes StorageClass for model cache PVCs (uses cluster default if empty)")
+	flag.StringVar(&storageSize, "storage-size", "", "Override PVC storage size (e.g., 50Gi). Default: from test case config")
 	flag.StringVar(&testMode, "mode", "deploy", "Test mode: 'deploy' (full lifecycle), 'discover' (validate existing), or 'cache' (download models only)")
 	flag.StringVar(&endpoint, "endpoint", "", "Service endpoint URL for discover mode (e.g., http://my-llm-svc:8000)")
-	flag.StringVar(&modelSource, "model-source", "pvc", "Model source: 'pvc' (download to PVC first, default) or 'hf' (vLLM downloads from HuggingFace at startup)")
-	flag.BoolVar(&noCleanup, "no-cleanup", false, "Skip cleanup after tests (leave resources running for debugging)")
+	flag.StringVar(&modelSource, "model-source", "hf", "Model source: 'hf' (HuggingFace direct, default) or 'pvc' (download to PVC first)")
+	flag.StringVar(&modelOverride, "model", "", "Override model repo ID (e.g., Qwen/Qwen3-0.6B)")
+	flag.BoolVar(&noCleanup, "nocleanup", false, "Skip cleanup after tests (leave resources running for debugging)")
 }
 
 // findRootDir walks up from the current working directory to find the project root (containing go.mod).

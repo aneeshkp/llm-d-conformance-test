@@ -106,9 +106,9 @@ func (r *Reporter) Finalize() (string, error) {
 	r.report.Duration = r.report.EndTime.Sub(r.report.StartTime).String()
 
 	// Compute summary
-	for _, res := range r.report.Results {
+	for i := range r.report.Results {
 		r.report.Summary.Total++
-		switch res.Status {
+		switch r.report.Results[i].Status {
 		case StatusPass:
 			r.report.Summary.Passed++
 		case StatusFail:
@@ -118,7 +118,7 @@ func (r *Reporter) Finalize() (string, error) {
 		}
 	}
 
-	if err := os.MkdirAll(r.outputDir, 0o755); err != nil {
+	if err := os.MkdirAll(r.outputDir, 0o755); err != nil { //nolint:gosec // G301: report directory needs read access
 		return "", fmt.Errorf("creating report directory: %w", err)
 	}
 
@@ -130,9 +130,9 @@ func (r *Reporter) Finalize() (string, error) {
 	jsonPath := filepath.Join(r.outputDir, baseName+".json")
 	data, err := json.MarshalIndent(r.report, "", "  ")
 	if err != nil {
-		return "", fmt.Errorf("marshalling report: %w", err)
+		return "", fmt.Errorf("marshaling report: %w", err)
 	}
-	if err := os.WriteFile(jsonPath, data, 0o644); err != nil {
+	if err := os.WriteFile(jsonPath, data, 0o644); err != nil { //nolint:gosec // G306: report file needs read access
 		return "", fmt.Errorf("writing JSON report: %w", err)
 	}
 
@@ -181,7 +181,7 @@ func (r *Reporter) writeHTML(path string) error {
 	if err != nil {
 		return fmt.Errorf("creating HTML file: %w", err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	return tmpl.Execute(f, r.report)
 }
@@ -256,7 +256,7 @@ const htmlTemplate = `<!DOCTYPE html>
     <div class="result-header">
       <span class="badge {{statusClass .Status}}">{{statusIcon .Status}}</span>
       <span class="result-name">{{.Name}}</span>
-      <span class="result-meta">{{.Category}} | {{.Duration}}</span>
+      <span class="result-meta">{{.Model.Name}} | {{.Category}} | {{.Duration}}</span>
     </div>
     <div class="result-details">
       <table class="detail-table">

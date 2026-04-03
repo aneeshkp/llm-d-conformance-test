@@ -189,7 +189,7 @@ func (cm *CacheManager) CleanupCache(ctx context.Context, tc *config.TestCase) e
 	jobName := cm.jobName(pvcName)
 
 	// Delete job first
-	cm.kubeCmd(ctx, "delete", "job", jobName, "-n", cm.namespace, "--ignore-not-found=true")
+	_, _ = cm.kubeCmd(ctx, "delete", "job", jobName, "-n", cm.namespace, "--ignore-not-found=true")
 	// Delete PVC
 	_, err := cm.kubeCmd(ctx, "delete", "pvc", pvcName, "-n", cm.namespace, "--ignore-not-found=true")
 	return err

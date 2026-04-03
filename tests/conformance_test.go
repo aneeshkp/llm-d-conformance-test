@@ -14,6 +14,7 @@ import (
 	"github.com/aneeshkp/llm-d-conformance-test/framework/client"
 	"github.com/aneeshkp/llm-d-conformance-test/framework/config"
 	"github.com/aneeshkp/llm-d-conformance-test/framework/deployer"
+	"github.com/aneeshkp/llm-d-conformance-test/framework/metrics"
 	"github.com/aneeshkp/llm-d-conformance-test/framework/model"
 	"github.com/aneeshkp/llm-d-conformance-test/framework/reporter"
 	"github.com/aneeshkp/llm-d-conformance-test/framework/retry"
@@ -31,6 +32,15 @@ var (
 var _ = BeforeSuite(func() {
 	ctx = context.Background()
 
+	// Verify manifests are available (cloned via 'make setup')
+	if testMode != "discover" {
+		manifestDir := filepath.Join(findRootDir(), "deploy", "manifests")
+		entries, _ := filepath.Glob(filepath.Join(manifestDir, "*.yaml"))
+		if len(entries) == 0 {
+			Fail("No manifests found in deploy/manifests/ — run 'make setup' to clone the manifest repo first")
+		}
+	}
+
 	// Resolve platform
 	p := deployer.Platform(platform)
 
@@ -41,7 +51,7 @@ var _ = BeforeSuite(func() {
 	}
 
 	// Create model downloader for PVC-based caching
-	dl = model.NewDownloader(kubeconfig, namespace, storageClass, platform)
+	dl = model.NewDownloader(kubeconfig, namespace, storageClass, storageSize, platform, modelSource)
 	dl.LogFunc = func(format string, args ...interface{}) {
 		fmt.Fprintf(os.Stderr, format+"\n", args...)
 	}
@@ -89,8 +99,8 @@ var _ = BeforeSuite(func() {
 })
 
 var _ = AfterSuite(func() {
-	// Cleanup all remaining resources
-	if cleanupMgr != nil {
+	// Cleanup all remaining resources (skip if noCleanup flag is set)
+	if cleanupMgr != nil && !noCleanup {
 		errs := cleanupMgr.CleanupAll(ctx)
 		for _, err := range errs {
 			GinkgoWriter.Printf("Cleanup error: %v\n", err)
@@ -124,8 +134,17 @@ func loadAllTestCases() []*config.TestCase {
 
 // shouldRunTestCase checks if a test case matches the runtime filters.
 func shouldRunTestCase(tc *config.TestCase) bool {
-	if testCaseName != "" && tc.Name != testCaseName {
-		return false
+	if testCaseName != "" {
+		match := false
+		for _, name := range strings.Split(testCaseName, ",") {
+			if strings.TrimSpace(name) == tc.Name {
+				match = true
+				break
+			}
+		}
+		if !match {
+			return false
+		}
 	}
 	if labels != "" {
 		filtered := config.FilterTestCasesByLabels([]*config.TestCase{tc}, splitLabels(labels))
@@ -138,6 +157,7 @@ func shouldRunTestCase(tc *config.TestCase) bool {
 			return false
 		}
 	}
+
 	return true
 }
 
@@ -154,6 +174,13 @@ func splitLabels(s string) []string {
 func skipIfDiscover() {
 	if testMode == "discover" {
 		Skip("discover mode — using existing deployment")
+	}
+}
+
+// skipIfCache skips the current spec if running in cache mode (download only).
+func skipIfCache() {
+	if testMode == "cache" {
+		Skip("cache mode — download only, skipping deployment and validation")
 	}
 }
 
@@ -181,6 +208,8 @@ var _ = Describe("LLM-D Conformance", func() {
 				start        time.Time
 				shouldRun    bool
 				modelInfo    reporter.ModelInfo
+				vllmMetrics  []*metrics.ScrapeResult
+				eppMetrics   []*metrics.ScrapeResult
 			)
 
 			BeforeAll(func() {
@@ -188,36 +217,44 @@ var _ = Describe("LLM-D Conformance", func() {
 				if !shouldRun {
 					Skip(fmt.Sprintf("filtered out by flags (testcase=%s, labels=%s)", testCaseName, labels))
 				}
-				// Resolve manifest path
+				// Resolve manifest path (flat directory — cloned from manifest repo)
 				if tc.Deployment.ManifestPath != "" && !filepath.IsAbs(tc.Deployment.ManifestPath) {
 					rootDir := findRootDir()
-					tc.Deployment.ManifestPath = filepath.Join(rootDir, "deploy", "manifests", modelSource, tc.Deployment.ManifestPath)
+					manifestDir := filepath.Join(rootDir, "deploy", "manifests")
+					resolved := filepath.Join(manifestDir, tc.Deployment.ManifestPath)
+					if _, err := os.Stat(resolved); os.IsNotExist(err) {
+						Fail(fmt.Sprintf("manifest %s not found at %s — run 'make setup' to clone the manifest repo", tc.Deployment.ManifestPath, manifestDir))
+					}
+					tc.Deployment.ManifestPath = resolved
 				}
 				start = time.Now()
-				// Determine the actual model URI based on model source
-				modelURI := tc.Model.URI
-				if modelSource == "pvc" && !strings.HasPrefix(tc.Model.URI, "pvc://") {
-					// Read the URI from the pvc manifest to get the actual pvc:// path
-					manifestPath := tc.Deployment.ManifestPath
-					if manifestPath != "" {
-						data, err := os.ReadFile(manifestPath)
-						if err == nil {
-							for _, line := range strings.Split(string(data), "\n") {
-								trimmed := strings.TrimSpace(line)
-								if strings.HasPrefix(trimmed, "uri:") {
-									modelURI = strings.TrimSpace(strings.TrimPrefix(trimmed, "uri:"))
-									break
-								}
-							}
-						}
-					}
+
+				// Apply model override if provided
+				if modelOverride != "" {
+					tc.Model.Name = modelOverride
+					tc.Model.URI = "hf://" + modelOverride
 				}
+
+				// Set the model URI based on model source — deployer patches the manifest with this.
+				// In cache mode, keep the original URI so PREP doesn't skip (it checks for pvc:// prefix).
+				if testMode != "cache" && (modelSource == "pvc" || modelSource == "pvc-snapshot") {
+					tc.Model.URI = dl.PVCModelURI(tc)
+				}
+				// For hf, tc.Model.URI already has hf:// from the test case config
+
 				modelInfo = reporter.ModelInfo{
 					Name:     tc.Model.Name,
-					URI:      modelURI,
+					URI:      tc.Model.URI,
 					Category: tc.Model.Category,
 				}
 				logStep("Testing: %s (%s) [mode=%s, model-source=%s]", tc.Name, tc.Description, testMode, modelSource)
+
+				// Pre-cleanup: delete any leftover LLMInferenceService from previous runs
+				if testMode != "cache" && testMode != "discover" {
+					name := deployer.ExtractLLMISVCName(tc)
+					logStep("[%s] Pre-cleanup: deleting any existing LLMInferenceService %s", tc.Name, name)
+					_, _ = dep.Kubectl(ctx, "delete", "llmisvc", name, "-n", dep.Namespace, "--ignore-not-found", "--wait=true", "--timeout=60s")
+				}
 			})
 
 			// Record each phase result directly to reporter
@@ -234,13 +271,14 @@ var _ = Describe("LLM-D Conformance", func() {
 				}
 				if rep != nil {
 					rep.AddResult(reporter.TestResult{
-						Name:      fmt.Sprintf("%s/%s", tc.Name, report.LeafNodeText),
-						Category:  tc.Model.Category,
-						Status:    status,
-						StartTime: start,
-						EndTime:   time.Now(),
-						Duration:  time.Since(start).String(),
-						Model:     modelInfo,
+						Name:        fmt.Sprintf("%s/%s", tc.Name, report.LeafNodeText),
+						Description: tc.Description,
+						Category:    tc.Model.Category,
+						Status:      status,
+						StartTime:   start,
+						EndTime:     time.Now(),
+						Duration:    time.Since(start).String(),
+						Model:       modelInfo,
 					})
 				}
 			})
@@ -272,6 +310,7 @@ var _ = Describe("LLM-D Conformance", func() {
 			// ── Phase 2: PREREQ ────────────────────────────────────
 			It("should have LLMInferenceService CRD installed", func() {
 				skipIfDiscover()
+				skipIfCache()
 				logStep("[%s] Phase 2: PREREQ — Checking CRD", tc.Name)
 				crdExists, err := dep.CheckCRDExists(ctx, "llminferenceservices.serving.kserve.io")
 				if err != nil || !crdExists {
@@ -282,6 +321,7 @@ var _ = Describe("LLM-D Conformance", func() {
 			// ── Phase 3: DEPLOY ────────────────────────────────────
 			It("should deploy LLMInferenceService manifest", func() {
 				skipIfDiscover()
+				skipIfCache()
 				logStep("[%s] Phase 3: DEPLOY — Applying manifest (model-source=%s)", tc.Name, modelSource)
 				deployResult := dep.Deploy(ctx, tc)
 				if !deployResult.Success {
@@ -303,6 +343,7 @@ var _ = Describe("LLM-D Conformance", func() {
 			// ── Phase 4a: Service created ──────────────────────────
 			It("should create Service", func() {
 				skipIfDiscover()
+				skipIfCache()
 				name := deployer.ExtractLLMISVCName(tc)
 				logStep("[%s] Checking Service", tc.Name)
 
@@ -325,6 +366,7 @@ var _ = Describe("LLM-D Conformance", func() {
 			// ── Phase 4b: HTTPRoute created ────────────────────────
 			It("should create HTTPRoute", func() {
 				skipIfDiscover()
+				skipIfCache()
 				name := deployer.ExtractLLMISVCName(tc)
 				logStep("[%s] Checking HTTPRoute", tc.Name)
 
@@ -344,9 +386,92 @@ var _ = Describe("LLM-D Conformance", func() {
 				}
 			})
 
-			// ── Phase 4c: InferencePool created ────────────────────
+			// ── Phase 4c: Gateway programmed ──────────────────────
+			It("should have Gateway programmed with address", func() {
+				skipIfDiscover()
+				skipIfCache()
+				logStep("[%s] Checking Gateway is Programmed", tc.Name)
+
+				err := retry.UntilSuccess(ctx, retry.Options{
+					Timeout:  2 * time.Minute,
+					Interval: 5 * time.Second,
+					Name:     "gateway-programmed",
+				}, func() error {
+					// Find gateway referenced by the LLMInferenceService (check common namespaces)
+					for _, gwNS := range []string{"opendatahub", "kserve", "istio-system", dep.Namespace} {
+						out, err := dep.Kubectl(ctx, "get", "gateway", "-n", gwNS,
+							"-o", "jsonpath={range .items[*]}{.metadata.name}|{.status.conditions[?(@.type==\"Programmed\")].status}|{.status.addresses[0].value}{\"\\n\"}{end}")
+						if err != nil || strings.TrimSpace(out) == "" {
+							continue
+						}
+						for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+							parts := strings.SplitN(line, "|", 3)
+							if len(parts) < 3 {
+								continue
+							}
+							gwName := strings.TrimSpace(parts[0])
+							programmed := strings.TrimSpace(parts[1])
+							address := strings.TrimSpace(parts[2])
+							if strings.EqualFold(programmed, "True") && address != "" {
+								logStep("[%s]   Gateway %s/%s: Programmed=True, address=%s", tc.Name, gwNS, gwName, address)
+								return nil
+							}
+							return fmt.Errorf("Gateway %s/%s: Programmed=%s, address=%s", gwNS, gwName, programmed, address)
+						}
+					}
+					return fmt.Errorf("no Gateway found in cluster")
+				})
+				if err != nil {
+					Fail(fmt.Sprintf("Gateway not programmed: %v", err))
+				}
+			})
+
+			// ── Phase 4d: HTTPRoute accepted by Gateway ───────────
+			It("should have HTTPRoute accepted by Gateway (resolvedRefs=True)", func() {
+				skipIfDiscover()
+				skipIfCache()
+				name := deployer.ExtractLLMISVCName(tc)
+				logStep("[%s] Checking HTTPRoute is accepted by Gateway", tc.Name)
+
+				err := retry.UntilSuccess(ctx, retry.Options{
+					Timeout:  2 * time.Minute,
+					Interval: 5 * time.Second,
+					Name:     "httproute-accepted-" + name,
+				}, func() error {
+					// Get HTTPRoute parent status
+					out, _ := dep.Kubectl(ctx, "get", "httproute", "-n", dep.Namespace, "-l",
+						fmt.Sprintf("app.kubernetes.io/name=%s", name),
+						"-o", "jsonpath={range .items[*]}{.metadata.name}|{.status.parents[0].conditions[?(@.type==\"Accepted\")].status}|{.status.parents[0].conditions[?(@.type==\"ResolvedRefs\")].status}{end}")
+					out = strings.TrimSpace(out)
+					if out == "" {
+						return fmt.Errorf("HTTPRoute status not available yet")
+					}
+					parts := strings.SplitN(out, "|", 3)
+					if len(parts) < 3 {
+						return fmt.Errorf("unexpected HTTPRoute status format: %s", out)
+					}
+					routeName := strings.TrimSpace(parts[0])
+					accepted := strings.TrimSpace(parts[1])
+					resolvedRefs := strings.TrimSpace(parts[2])
+
+					if !strings.EqualFold(accepted, "True") {
+						return fmt.Errorf("HTTPRoute %s not accepted by Gateway (Accepted=%s)", routeName, accepted)
+					}
+					if !strings.EqualFold(resolvedRefs, "True") {
+						return fmt.Errorf("HTTPRoute %s has unresolved refs (ResolvedRefs=%s)", routeName, resolvedRefs)
+					}
+					logStep("[%s]   HTTPRoute %s: Accepted=True, ResolvedRefs=True", tc.Name, routeName)
+					return nil
+				})
+				if err != nil {
+					Fail(fmt.Sprintf("HTTPRoute not accepted by Gateway: %v", err))
+				}
+			})
+
+			// ── Phase 4e: InferencePool created ────────────────────
 			It("should create InferencePool", func() {
 				skipIfDiscover()
+				skipIfCache()
 				logStep("[%s] Checking InferencePool", tc.Name)
 
 				err := retry.UntilSuccess(ctx, retry.Options{
@@ -368,6 +493,7 @@ var _ = Describe("LLM-D Conformance", func() {
 			// ── Phase 4d: Pods running ─────────────────────────────
 			It("should have pods running without crashes", func() {
 				skipIfDiscover()
+				skipIfCache()
 				name := deployer.ExtractLLMISVCName(tc)
 				logStep("[%s] Checking pods", tc.Name)
 
@@ -401,6 +527,7 @@ var _ = Describe("LLM-D Conformance", func() {
 			// ── Phase 4e: Model downloaded (HF mode) ───────────────
 			It("should download model via storage initializer", func() {
 				skipIfDiscover()
+				skipIfCache()
 				if modelSource != "hf" {
 					Skip("model-source=pvc — model pre-cached, no init container download")
 				}
@@ -414,7 +541,7 @@ var _ = Describe("LLM-D Conformance", func() {
 				}, func() error {
 					// Check init container status
 					out, _ := dep.Kubectl(ctx, "get", "pods", "-n", dep.Namespace, "-l",
-						fmt.Sprintf("app.kubernetes.io/name=%s,app.kubernetes.io/component=llminferenceservice-workload", name),
+						fmt.Sprintf(metrics.WorkloadLabelFmt, name),
 						"-o", "jsonpath={range .items[*]}{range .status.initContainerStatuses[*]}{.name}={.ready} {end}{end}")
 					initStatus := strings.TrimSpace(out)
 					if initStatus == "" {
@@ -424,7 +551,7 @@ var _ = Describe("LLM-D Conformance", func() {
 					if !strings.Contains(initStatus, "storage-initializer=true") {
 						// Show init container logs for progress
 						initLogs, _ := dep.Kubectl(ctx, "logs", "-n", dep.Namespace, "-l",
-							fmt.Sprintf("app.kubernetes.io/name=%s,app.kubernetes.io/component=llminferenceservice-workload", name),
+							fmt.Sprintf(metrics.WorkloadLabelFmt, name),
 							"-c", "storage-initializer", "--tail=1")
 						initLogs = strings.TrimSpace(initLogs)
 						if initLogs != "" &&
@@ -445,6 +572,7 @@ var _ = Describe("LLM-D Conformance", func() {
 			// ── Phase 4f: READY ────────────────────────────────────
 			It("should become READY", func() {
 				skipIfDiscover()
+				skipIfCache()
 				logStep("[%s] Phase 4: READY — Waiting for service readiness (timeout=%s)", tc.Name, tc.Deployment.ReadyTimeout.Duration)
 				err := dep.WaitForReady(ctx, tc)
 				if err != nil {
@@ -452,7 +580,7 @@ var _ = Describe("LLM-D Conformance", func() {
 				}
 				// Capture the actual vLLM image and version from the deployed pod
 				name := deployer.ExtractLLMISVCName(tc)
-				label := fmt.Sprintf("app.kubernetes.io/name=%s,app.kubernetes.io/component=llminferenceservice-workload", name)
+				label := fmt.Sprintf(metrics.WorkloadLabelFmt, name)
 
 				// Get image
 				vllmImage, _ := dep.Kubectl(ctx, "get", "pods", "-n", dep.Namespace, "-l", label,
@@ -487,11 +615,12 @@ var _ = Describe("LLM-D Conformance", func() {
 			// ── Phase 5: Model files at /mnt/models ────────────────
 			It("should have model files at /mnt/models", func() {
 				skipIfDiscover()
+				skipIfCache()
 				name := deployer.ExtractLLMISVCName(tc)
 				logStep("[%s] Checking model files at /mnt/models", tc.Name)
 
 				// Get pod name first, then exec into it
-				label := fmt.Sprintf("app.kubernetes.io/name=%s,app.kubernetes.io/component=llminferenceservice-workload", name)
+				label := fmt.Sprintf(metrics.WorkloadLabelFmt, name)
 				podName, _ := dep.Kubectl(ctx, "get", "pods", "-n", dep.Namespace, "-l", label,
 					"-o", "jsonpath={.items[0].metadata.name}")
 				pod := strings.TrimSpace(podName)
@@ -527,7 +656,8 @@ var _ = Describe("LLM-D Conformance", func() {
 
 			// ── Phase 6: HEALTH ────────────────────────────────────
 			It("should pass health check", func() {
-				logStep("[%s] Phase 5: HEALTH — Validating /health endpoint", tc.Name)
+				skipIfCache()
+				logStep("[%s] Phase 6: HEALTH — Validating /health endpoint", tc.Name)
 
 				if testMode == "discover" {
 					svcEndpoint = endpoint
@@ -555,6 +685,7 @@ var _ = Describe("LLM-D Conformance", func() {
 
 			// ── Phase 6: MODEL ─────────────────────────────────────
 			It("should list model in /v1/models", func() {
+				skipIfCache()
 				logStep("[%s] Phase 6: MODEL — Validating model listing", tc.Name)
 				models, err := llmClient.ListModels(ctx)
 				if err != nil {
@@ -577,11 +708,48 @@ var _ = Describe("LLM-D Conformance", func() {
 
 			// ── Phase 7: INFERENCE ─────────────────────────────────
 			It("should return inference response", func() {
-				if !tc.Validation.InferenceCheck || len(tc.Validation.TestPrompts) == 0 {
-					Skip("inferenceCheck=false or no testPrompts")
+				skipIfCache()
+				hasChatPrompts := len(tc.Validation.ChatPrompts) > 0
+				hasTestPrompts := len(tc.Validation.TestPrompts) > 0
+				if !tc.Validation.InferenceCheck || (!hasTestPrompts && !hasChatPrompts) {
+					Skip("inferenceCheck=false or no prompts configured")
 				}
-				logStep("[%s] Phase 7: INFERENCE — Running %d test prompt(s)", tc.Name, len(tc.Validation.TestPrompts))
 
+				// Structured chat prompts (system+user) — used for cache-aware tests
+				if hasChatPrompts {
+					logStep("[%s] Phase 7: INFERENCE — Running %d structured chat prompt(s)", tc.Name, len(tc.Validation.ChatPrompts))
+					for i, cp := range tc.Validation.ChatPrompts {
+						var messages []client.ChatMessage
+						if cp.System != "" {
+							messages = append(messages, client.ChatMessage{Role: "system", Content: cp.System})
+						}
+						messages = append(messages, client.ChatMessage{Role: "user", Content: cp.User})
+
+						resp, err := llmClient.ChatCompletions(ctx, client.ChatRequest{
+							Model:     tc.Model.Name,
+							Messages:  messages,
+							MaxTokens: 50,
+						})
+						if err != nil {
+							Fail(fmt.Sprintf("chat[%d] %q failed: %v", i, cp.User, err))
+						}
+						if len(resp.Choices) == 0 || resp.Choices[0].Message.Content == "" {
+							Fail(fmt.Sprintf("chat[%d] %q returned empty response", i, cp.User))
+						}
+						logStep("[%s]   chat[%d] PASSED (tokens=%d, user=%q)", tc.Name, i, resp.Usage.TotalTokens, cp.User)
+
+						// Wait between requests so the EPP prefix indexer can update
+						// and route the next request to the pod that cached the prefix.
+						if i < len(tc.Validation.ChatPrompts)-1 {
+							logStep("[%s]   waiting 5s for EPP prefix index sync...", tc.Name)
+							time.Sleep(5 * time.Second)
+						}
+					}
+					return
+				}
+
+				// Simple string prompts — standard test cases
+				logStep("[%s] Phase 7: INFERENCE — Running %d test prompt(s)", tc.Name, len(tc.Validation.TestPrompts))
 				for i, prompt := range tc.Validation.TestPrompts {
 					resp, err := llmClient.ChatCompletions(ctx, client.ChatRequest{
 						Model: tc.Model.Name,
@@ -591,7 +759,6 @@ var _ = Describe("LLM-D Conformance", func() {
 						MaxTokens: 50,
 					})
 					if err != nil {
-						// Fallback to completions API
 						compResp, compErr := llmClient.Completions(ctx, client.CompletionRequest{
 							Model:     tc.Model.Name,
 							Prompt:    prompt,
@@ -613,20 +780,373 @@ var _ = Describe("LLM-D Conformance", func() {
 				}
 			})
 
-			// ── Phase 8: CLEANUP ───────────────────────────────────
+			// ── Phase 8: METRICS — Scrape ─────────────────────────
+			It("should scrape metrics from pods", func() {
+				skipIfCache()
+				mc := tc.Validation.MetricsCheck
+				if mc == nil || !mc.Enabled {
+					Skip("metricsCheck not enabled")
+				}
+
+				name := deployer.ExtractLLMISVCName(tc)
+				scraper := &metrics.Scraper{
+					Kubectl:   dep.Kubectl,
+					Namespace: dep.Namespace,
+					LogFunc:   logStep,
+				}
+
+				if mc.CheckVLLM || mc.CheckPD || mc.CheckPrefixCache {
+					logStep("[%s] Phase 8: METRICS — Scraping vLLM pod metrics", tc.Name)
+					var err error
+					vllmMetrics, err = scraper.ScrapeVLLMPods(ctx, name)
+					if err != nil {
+						logStep("[%s]   WARNING: could not scrape vLLM metrics: %v", tc.Name, err)
+					} else {
+						logStep("[%s]   scraped %d vLLM pod(s)", tc.Name, len(vllmMetrics))
+					}
+				}
+
+				if mc.CheckEPP || mc.CheckScheduler || mc.CheckPrefixCache {
+					logStep("[%s]   scraping EPP scheduler metrics...", tc.Name)
+					var err error
+					eppMetrics, err = scraper.ScrapeEPPPods(ctx, name)
+					if err != nil {
+						logStep("[%s]   WARNING: could not scrape EPP metrics: %v", tc.Name, err)
+					} else {
+						logStep("[%s]   scraped %d EPP pod(s)", tc.Name, len(eppMetrics))
+					}
+				}
+			})
+
+			// ── Phase 8a: vllm:prefix_cache_queries ───────────────
+			It("vllm:prefix_cache_queries should be > 0 (prefix cache lookups received)", func() {
+				skipIfCache()
+				mc := tc.Validation.MetricsCheck
+				if mc == nil || !mc.CheckPrefixCache {
+					Skip("prefix cache check not enabled")
+				}
+				checks := metrics.ValidateCacheAwareMetrics(vllmMetrics, nil)
+				for _, c := range checks {
+					if c.Metric == metrics.MetricPrefixCacheQueries {
+						logStep("[%s]   %s", tc.Name, c.Message)
+						if !c.Passed {
+							Fail(c.Message)
+						}
+						return
+					}
+				}
+				Skip("vllm:prefix_cache_queries not found in scraped metrics")
+			})
+
+			// ── Phase 8b: vllm:prefix_cache_hits ──────────────────
+			It("vllm:prefix_cache_hits should be > 0 (cache hits from repeated prefix)", func() {
+				skipIfCache()
+				mc := tc.Validation.MetricsCheck
+				if mc == nil || !mc.CheckPrefixCache {
+					Skip("prefix cache check not enabled")
+				}
+				checks := metrics.ValidateCacheAwareMetrics(vllmMetrics, nil)
+				for _, c := range checks {
+					if c.Metric == metrics.MetricPrefixCacheHits {
+						logStep("[%s]   %s", tc.Name, c.Message)
+						if !c.Passed {
+							Fail(c.Message)
+						}
+						return
+					}
+				}
+				Skip("vllm:prefix_cache_hits not found in scraped metrics")
+			})
+
+			// ── Phase 8c: prefix cache hit rate ───────────────────
+			It("prefix_cache_hit_rate should be > 0% (cache-aware routing effective)", func() {
+				skipIfCache()
+				mc := tc.Validation.MetricsCheck
+				if mc == nil || !mc.CheckPrefixCache {
+					Skip("prefix cache check not enabled")
+				}
+				checks := metrics.ValidateCacheAwareMetrics(vllmMetrics, nil)
+				for _, c := range checks {
+					if c.Metric == "derived:prefix_cache_hit_rate" {
+						logStep("[%s]   %s", tc.Name, c.Message)
+						if !c.Passed {
+							Fail(c.Message)
+						}
+						return
+					}
+				}
+				Skip("not enough data to compute hit rate")
+			})
+
+			// ── Phase 8d: vllm:gpu_cache_usage_perc ───────────────
+			It("vllm:gpu_cache_usage_perc should be > 0 (KV cache in use)", func() {
+				skipIfCache()
+				mc := tc.Validation.MetricsCheck
+				if mc == nil || !mc.CheckPrefixCache && !mc.CheckVLLM {
+					Skip("vLLM cache check not enabled")
+				}
+				if len(vllmMetrics) == 0 {
+					Skip("no vLLM metrics scraped")
+				}
+				checks := metrics.ValidateCacheAwareMetrics(vllmMetrics, nil)
+				for _, c := range checks {
+					if c.Metric == metrics.MetricGPUCacheUsage {
+						logStep("[%s]   %s", tc.Name, c.Message)
+						if !c.Passed {
+							Fail(c.Message)
+						}
+						return
+					}
+				}
+				Skip("vllm:gpu_cache_usage_perc not found")
+			})
+
+			// ── Phase 8e: EPP prefix_indexer_size ─────────────────
+			It("inference_extension_prefix_indexer_size should be > 0 (EPP prefix index populated)", func() {
+				skipIfCache()
+				mc := tc.Validation.MetricsCheck
+				if mc == nil || !mc.CheckPrefixCache {
+					Skip("prefix cache check not enabled")
+				}
+				if len(eppMetrics) == 0 {
+					Skip("no EPP metrics scraped")
+				}
+				checks := metrics.ValidateCacheAwareMetrics(nil, eppMetrics)
+				for _, c := range checks {
+					if c.Metric == metrics.MetricPrefixIndexerSize {
+						logStep("[%s]   %s", tc.Name, c.Message)
+						if !c.Passed {
+							Fail(c.Message)
+						}
+						return
+					}
+				}
+				Skip("inference_extension_prefix_indexer_size not found")
+			})
+
+			// ── Phase 8f: vllm:prompt_tokens_total ────────────────
+			It("vllm:prompt_tokens_total should be > 0 (prefill pods processing prompts)", func() {
+				skipIfCache()
+				mc := tc.Validation.MetricsCheck
+				if mc == nil || !mc.CheckPD {
+					Skip("P/D check not enabled")
+				}
+				if len(vllmMetrics) == 0 {
+					Skip("no vLLM metrics scraped")
+				}
+				checks := metrics.ValidatePDMetrics(vllmMetrics)
+				for _, c := range checks {
+					if c.Metric == metrics.MetricPromptTokens {
+						logStep("[%s]   %s", tc.Name, c.Message)
+						if !c.Passed {
+							Fail(c.Message)
+						}
+						return
+					}
+				}
+				Skip("vllm:prompt_tokens_total not found")
+			})
+
+			// ── Phase 8g: vllm:generation_tokens_total ────────────
+			It("vllm:generation_tokens_total should be > 0 (decode pods generating tokens)", func() {
+				skipIfCache()
+				mc := tc.Validation.MetricsCheck
+				if mc == nil || !mc.CheckPD {
+					Skip("P/D check not enabled")
+				}
+				if len(vllmMetrics) == 0 {
+					Skip("no vLLM metrics scraped")
+				}
+				checks := metrics.ValidatePDMetrics(vllmMetrics)
+				for _, c := range checks {
+					if c.Metric == metrics.MetricGenTokens {
+						logStep("[%s]   %s", tc.Name, c.Message)
+						if !c.Passed {
+							Fail(c.Message)
+						}
+						return
+					}
+				}
+				Skip("vllm:generation_tokens_total not found")
+			})
+
+			// ── Phase 8h: vllm:request_success_total ──────────────
+			It("vllm:request_success_total should be > 0 (requests completed)", func() {
+				skipIfCache()
+				mc := tc.Validation.MetricsCheck
+				if mc == nil || !mc.CheckPD {
+					Skip("P/D check not enabled")
+				}
+				if len(vllmMetrics) == 0 {
+					Skip("no vLLM metrics scraped")
+				}
+				checks := metrics.ValidatePDMetrics(vllmMetrics)
+				for _, c := range checks {
+					if c.Metric == metrics.MetricRequestSuccess {
+						logStep("[%s]   %s", tc.Name, c.Message)
+						if !c.Passed {
+							Fail(c.Message)
+						}
+						return
+					}
+				}
+				Skip("vllm:request_success_total not found")
+			})
+
+			// ── Phase 8i: nixl:kv_transfer_count_total ────────────
+			It("nixl:kv_transfer_count_total should be > 0 (NIXL KV transfers happened)", func() {
+				skipIfCache()
+				mc := tc.Validation.MetricsCheck
+				if mc == nil || !mc.CheckNIXL {
+					Skip("NIXL check not enabled")
+				}
+				if len(vllmMetrics) == 0 {
+					Skip("no vLLM metrics scraped")
+				}
+				checks := metrics.ValidatePDMetrics(vllmMetrics)
+				for _, c := range checks {
+					if c.Metric == metrics.MetricNIXLTransfers {
+						logStep("[%s]   %s", tc.Name, c.Message)
+						if !c.Passed {
+							Fail(c.Message)
+						}
+						return
+					}
+				}
+				logStep("[%s]   WARNING: nixl:kv_transfer_count_total not found (no RDMA/NIXL on this cluster)", tc.Name)
+				AddReportEntry("warning", "NIXL metrics not available — no RDMA on this cluster")
+			})
+
+			// ── Phase 8j: nixl:kv_transfer_failures_total ─────────
+			It("nixl:kv_transfer_failures_total should be 0 (no KV transfer failures)", func() {
+				skipIfCache()
+				mc := tc.Validation.MetricsCheck
+				if mc == nil || !mc.CheckNIXL {
+					Skip("NIXL check not enabled")
+				}
+				if len(vllmMetrics) == 0 {
+					Skip("no vLLM metrics scraped")
+				}
+				checks := metrics.ValidatePDMetrics(vllmMetrics)
+				for _, c := range checks {
+					if c.Metric == metrics.MetricNIXLFailures {
+						logStep("[%s]   %s", tc.Name, c.Message)
+						if !c.Passed {
+							Fail(c.Message)
+						}
+						return
+					}
+				}
+				logStep("[%s]   WARNING: nixl:kv_transfer_failures_total not found (no RDMA/NIXL on this cluster)", tc.Name)
+				AddReportEntry("warning", "NIXL failure metrics not available — no RDMA on this cluster")
+			})
+
+			// ── Phase 8k: scheduler_e2e_duration ──────────────────
+			It("inference_extension_scheduler_e2e_duration should be > 0 (scheduler routing requests)", func() {
+				skipIfCache()
+				mc := tc.Validation.MetricsCheck
+				if mc == nil || !mc.CheckScheduler {
+					Skip("scheduler check not enabled")
+				}
+				if len(eppMetrics) == 0 {
+					Skip("no EPP metrics scraped")
+				}
+				checks := metrics.ValidateSchedulerMetrics(eppMetrics)
+				for _, c := range checks {
+					if c.Metric == metrics.MetricSchedulerE2E {
+						logStep("[%s]   %s", tc.Name, c.Message)
+						if !c.Passed {
+							Fail(c.Message)
+						}
+						return
+					}
+				}
+				Skip("inference_extension_scheduler_e2e_duration not found")
+			})
+
+			// ── Phase 8l: inference_objective_request_total ───────
+			It("inference_objective_request_total should be > 0 (requests routed through EPP)", func() {
+				skipIfCache()
+				mc := tc.Validation.MetricsCheck
+				if mc == nil || !mc.CheckScheduler && !mc.CheckEPP {
+					Skip("EPP/scheduler check not enabled")
+				}
+				if len(eppMetrics) == 0 {
+					Skip("no EPP metrics scraped")
+				}
+				checks := metrics.ValidateSchedulerMetrics(eppMetrics)
+				for _, c := range checks {
+					if c.Metric == metrics.MetricRequestTotal {
+						logStep("[%s]   %s", tc.Name, c.Message)
+						if !c.Passed {
+							Fail(c.Message)
+						}
+						return
+					}
+				}
+				Skip("inference_objective_request_total not found")
+			})
+
+			// ── Phase 8m: inference_objective_request_error_total ─
+			It("inference_objective_request_error_total should be 0 (no routing errors)", func() {
+				skipIfCache()
+				mc := tc.Validation.MetricsCheck
+				if mc == nil || !mc.CheckScheduler && !mc.CheckEPP {
+					Skip("EPP/scheduler check not enabled")
+				}
+				if len(eppMetrics) == 0 {
+					Skip("no EPP metrics scraped")
+				}
+				checks := metrics.ValidateSchedulerMetrics(eppMetrics)
+				for _, c := range checks {
+					if c.Metric == metrics.MetricRequestErrorTotal {
+						logStep("[%s]   %s", tc.Name, c.Message)
+						if !c.Passed {
+							Fail(c.Message)
+						}
+						return
+					}
+				}
+				Skip("inference_objective_request_error_total not found")
+			})
+
+			// ── Phase 8n: inference_pool_ready_pods ───────────────
+			It("inference_pool_ready_pods should be > 0 (pods available for routing)", func() {
+				skipIfCache()
+				mc := tc.Validation.MetricsCheck
+				if mc == nil || !mc.CheckScheduler && !mc.CheckEPP {
+					Skip("EPP/scheduler check not enabled")
+				}
+				if len(eppMetrics) == 0 {
+					Skip("no EPP metrics scraped")
+				}
+				checks := metrics.ValidateSchedulerMetrics(eppMetrics)
+				for _, c := range checks {
+					if c.Metric == metrics.MetricPoolReadyPods {
+						logStep("[%s]   %s", tc.Name, c.Message)
+						if !c.Passed {
+							Fail(c.Message)
+						}
+						return
+					}
+				}
+				Skip("inference_pool_ready_pods not found")
+			})
+
+			// ── Phase 9: CLEANUP ───────────────────────────────────
 			AfterAll(func() {
 				if !shouldRun {
 					return
 				}
-				if testMode == "discover" || noCleanup {
+				if testMode == "discover" || testMode == "cache" || noCleanup {
 					if noCleanup {
 						logStep("[%s] CLEANUP SKIPPED: --no-cleanup flag set (resources left running)", tc.Name)
 					}
 					return
 				}
 				if tc.Cleanup {
-					logStep("[%s] Phase 8: CLEANUP — Removing deployed resources", tc.Name)
-					cleanupMgr.CleanupOne(ctx, tc.Name)
+					logStep("[%s] Phase 9: CLEANUP — Removing deployed resources", tc.Name)
+					_ = cleanupMgr.CleanupOne(ctx, tc.Name)
 					if tc.Model.Cache != nil && tc.Model.Cache.Enabled {
 						dl.Cleanup(ctx, tc)
 					}
@@ -705,3 +1225,4 @@ func resolveTestCases() ([]*config.TestCase, error) {
 	}
 	return allCases, nil
 }
+

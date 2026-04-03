@@ -1,24 +1,17 @@
-name: qwen2-7b-gpu-pd-tcp
-description: "3 GPUs - Qwen2.5-7B P/D over TCP (2 decode + 1 prefill)"
-labels:
-  - gpu
-  - multi-node-gpu
-  - qwen2
-  - prefill-decode
-  - pd
-  - tcp
+name: pd
+description: "P/D disaggregation, 2 prefill + 1 decode (default: Qwen/Qwen3-0.6B)"
 model:
-  name: Qwen/Qwen2.5-7B-Instruct
-  uri: hf://Qwen/Qwen2.5-7B-Instruct
-  displayName: qwen2-7b-instruct-pd-tcp
+  name: Qwen/Qwen3-0.6B
+  uri: hf://Qwen/Qwen3-0.6B
+  displayName: qwen3-0.6b-pd
   category: multi-node-gpu
   cache:
     enabled: true
-    storageSize: 100Gi
+    storageSize: 10Gi
     keepPVC: true
-    timeout: 60m
+    timeout: 15m
 deployment:
-  manifestPath: qwen2-7b-gpu-pd-tcp.yaml
+  manifestPath: pd.yaml
   replicas: 1
   readyTimeout: 15m
   resources:
@@ -26,6 +19,13 @@ deployment:
     memory: 32Gi
     gpus: 1
     rdma: false
+  prefill:
+    replicas: 2
+    resources:
+      cpu: "4"
+      memory: 32Gi
+      gpus: 1
+      rdma: false
 validation:
   healthEndpoint: /health
   healthPort: 8000
@@ -38,4 +38,10 @@ validation:
   timeout: 2m
   retryAttempts: 3
   retryInterval: 15s
+  metricsCheck:
+    enabled: true
+    checkVLLM: true
+    checkPD: true
+    checkNIXL: true
+    checkScheduler: true
 cleanup: true

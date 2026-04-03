@@ -37,11 +37,11 @@ func LoadTestCase(path string) (*TestCase, error) {
 
 // LoadTestCasesFromDir loads all YAML test cases from a directory.
 func LoadTestCasesFromDir(dir string) ([]*TestCase, error) {
-	var cases []*TestCase
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return nil, fmt.Errorf("reading test case directory %s: %w", dir, err)
 	}
+	cases := make([]*TestCase, 0, len(entries))
 	for _, entry := range entries {
 		if entry.IsDir() {
 			continue
