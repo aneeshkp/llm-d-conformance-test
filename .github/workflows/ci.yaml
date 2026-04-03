@@ -85,5 +85,8 @@ jobs:
       - name: Clone manifests
         run: make setup
 
+      - name: Run unit tests
+        run: go test ./framework/... -v -count=1
+
       - name: Run smoke tests
         run: go test ./tests/smoke/ -v -timeout 30m
