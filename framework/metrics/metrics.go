@@ -269,10 +269,25 @@ func (s *Scraper) scrapePodsByLabel(ctx context.Context, label string, port int)
 	return results, nil
 }
 
-// ScrapeVLLMPods scrapes /metrics from all vLLM pods matching the given llmisvc name.
+// ScrapeVLLMPods scrapes /metrics from all vLLM pods (decode + prefill) matching the given llmisvc name.
 func (s *Scraper) ScrapeVLLMPods(ctx context.Context, llmisvcName string) ([]*ScrapeResult, error) {
+	// Scrape decode pods
 	label := fmt.Sprintf(WorkloadLabelFmt, llmisvcName)
-	return s.scrapePodsByLabel(ctx, label, 8000)
+	results, err := s.scrapePodsByLabel(ctx, label, 8000)
+	if err != nil {
+		s.log("  WARNING: failed to scrape decode pods: %v", err)
+	}
+
+	// Also scrape prefill pods (P/D deployments have separate prefill workloads)
+	prefillLabel := fmt.Sprintf("app.kubernetes.io/name=%s,app.kubernetes.io/component=llminferenceservice-workload-prefill", llmisvcName)
+	if prefillResults, err := s.scrapePodsByLabel(ctx, prefillLabel, 8000); err == nil {
+		results = append(results, prefillResults...)
+	}
+
+	if len(results) == 0 {
+		return nil, fmt.Errorf("no vLLM pods found for %s", llmisvcName)
+	}
+	return results, nil
 }
 
 // ScrapeEPPPods scrapes /metrics from EPP (scheduler) pods.

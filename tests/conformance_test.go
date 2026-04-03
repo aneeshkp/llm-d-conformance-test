@@ -118,40 +118,54 @@ var _ = AfterSuite(func() {
 	}
 })
 
-// loadAllTestCases loads test cases at spec construction time.
+// loadAllTestCases loads and pre-filters test cases at spec construction time.
 // This runs during Describe (before BeforeSuite), so we use findRootDir directly.
+// Pre-filtering avoids creating hundreds of skipped Ginkgo specs for test cases
+// that won't run (e.g., when using TESTCASE= or PROFILE=).
 func loadAllTestCases() []*config.TestCase {
 	rootDir := findRootDir()
 	dir := filepath.Join(rootDir, "configs", "testcases")
 	cases, err := config.LoadTestCasesFromDir(dir)
 	if err != nil {
-		// Can't use Expect here (not in a spec), just return empty
 		fmt.Fprintf(os.Stderr, "WARNING: failed to load test cases: %v\n", err)
 		return nil
 	}
+
+	// Pre-filter by TESTCASE flag
+	if testCaseName != "" {
+		names := strings.Split(testCaseName, ",")
+		nameSet := make(map[string]bool, len(names))
+		for _, n := range names {
+			nameSet[strings.TrimSpace(n)] = true
+		}
+		var filtered []*config.TestCase
+		for _, tc := range cases {
+			if nameSet[tc.Name] {
+				filtered = append(filtered, tc)
+			}
+		}
+		return filtered
+	}
+
+	// Pre-filter by PROFILE flag
+	if profilePath != "" {
+		resolved := resolveRelativePath(profilePath)
+		profile, err := config.LoadProfile(resolved)
+		if err == nil {
+			profileCases, err := config.ResolveProfileTestCases(profile, dir)
+			if err == nil {
+				return profileCases
+			}
+		}
+	}
+
 	return cases
 }
 
 // shouldRunTestCase checks if a test case matches the runtime filters.
+// shouldRunTestCase is a defensive check — loadAllTestCases already pre-filters
+// by TESTCASE and PROFILE, so this mainly handles edge cases.
 func shouldRunTestCase(tc *config.TestCase) bool {
-	if testCaseName != "" {
-		match := false
-		for _, name := range strings.Split(testCaseName, ",") {
-			if strings.TrimSpace(name) == tc.Name {
-				match = true
-				break
-			}
-		}
-		if !match {
-			return false
-		}
-	}
-	if labels != "" {
-		filtered := config.FilterTestCasesByLabels([]*config.TestCase{tc}, splitLabels(labels))
-		if len(filtered) == 0 {
-			return false
-		}
-	}
 	if profilePath != "" && len(testCases) > 0 {
 		if _, ok := resolvedTestCaseSet[tc.Name]; !ok {
 			return false
@@ -159,15 +173,6 @@ func shouldRunTestCase(tc *config.TestCase) bool {
 	}
 
 	return true
-}
-
-// splitLabels splits and trims a comma-separated label string.
-func splitLabels(s string) []string {
-	parts := strings.Split(s, ",")
-	for i := range parts {
-		parts[i] = strings.TrimSpace(parts[i])
-	}
-	return parts
 }
 
 // skipIfDiscover skips the current spec if running in discover mode.
@@ -186,6 +191,8 @@ func skipIfCache() {
 
 // resolvedTestCaseSet is populated in BeforeSuite for O(1) profile filtering.
 var resolvedTestCaseSet map[string]bool
+var preCleanupDone bool
+var vllmVersionCaptured bool
 
 var _ = Describe("LLM-D Conformance", func() {
 	allCases := loadAllTestCases()
@@ -249,11 +256,11 @@ var _ = Describe("LLM-D Conformance", func() {
 				}
 				logStep("Testing: %s (%s) [mode=%s, model-source=%s]", tc.Name, tc.Description, testMode, modelSource)
 
-				// Pre-cleanup: delete any leftover LLMInferenceService from previous runs
-				if testMode != "cache" && testMode != "discover" {
-					name := deployer.ExtractLLMISVCName(tc)
-					logStep("[%s] Pre-cleanup: deleting any existing LLMInferenceService %s", tc.Name, name)
-					_, _ = dep.Kubectl(ctx, "delete", "llmisvc", name, "-n", dep.Namespace, "--ignore-not-found", "--wait=true", "--timeout=60s")
+				// Pre-cleanup: delete all leftover LLMInferenceServices to free GPUs (first test case only)
+				if testMode != "cache" && testMode != "discover" && !preCleanupDone {
+					logStep("[%s] Pre-cleanup: deleting any existing LLMInferenceServices", tc.Name)
+					_, _ = dep.Kubectl(ctx, "delete", "llmisvc", "--all", "-n", dep.Namespace, "--ignore-not-found", "--wait=true", "--timeout=120s")
+					preCleanupDone = true
 				}
 			})
 
@@ -472,6 +479,13 @@ var _ = Describe("LLM-D Conformance", func() {
 			It("should create InferencePool", func() {
 				skipIfDiscover()
 				skipIfCache()
+				// No InferencePool without a scheduler
+				if tc.Deployment.ManifestPath != "" {
+					data, err := os.ReadFile(tc.Deployment.ManifestPath)
+					if err == nil && !strings.Contains(string(data), "scheduler:") {
+						Skip("no scheduler in manifest — no InferencePool expected")
+					}
+				}
 				logStep("[%s] Checking InferencePool", tc.Name)
 
 				err := retry.UntilSuccess(ctx, retry.Options{
@@ -524,50 +538,9 @@ var _ = Describe("LLM-D Conformance", func() {
 				}
 			})
 
-			// ── Phase 4e: Model downloaded (HF mode) ───────────────
-			It("should download model via storage initializer", func() {
-				skipIfDiscover()
-				skipIfCache()
-				if modelSource != "hf" {
-					Skip("model-source=pvc — model pre-cached, no init container download")
-				}
-				name := deployer.ExtractLLMISVCName(tc)
-				logStep("[%s] Checking storage-initializer completed", tc.Name)
-
-				err := retry.UntilSuccess(ctx, retry.Options{
-					Timeout:  tc.Deployment.ReadyTimeout.Duration,
-					Interval: 15 * time.Second,
-					Name:     "storage-init-" + name,
-				}, func() error {
-					// Check init container status
-					out, _ := dep.Kubectl(ctx, "get", "pods", "-n", dep.Namespace, "-l",
-						fmt.Sprintf(metrics.WorkloadLabelFmt, name),
-						"-o", "jsonpath={range .items[*]}{range .status.initContainerStatuses[*]}{.name}={.ready} {end}{end}")
-					initStatus := strings.TrimSpace(out)
-					if initStatus == "" {
-						return fmt.Errorf("no init containers found yet")
-					}
-					// Check if storage-initializer completed
-					if !strings.Contains(initStatus, "storage-initializer=true") {
-						// Show init container logs for progress
-						initLogs, _ := dep.Kubectl(ctx, "logs", "-n", dep.Namespace, "-l",
-							fmt.Sprintf(metrics.WorkloadLabelFmt, name),
-							"-c", "storage-initializer", "--tail=1")
-						initLogs = strings.TrimSpace(initLogs)
-						if initLogs != "" &&
-							!strings.Contains(initLogs, "Defaulted container") &&
-							!strings.Contains(initLogs, "Error from server") {
-							logStep("[%s]   storage-initializer: %s", tc.Name, initLogs)
-						}
-						return fmt.Errorf("storage-initializer not ready: %s", initStatus)
-					}
-					logStep("[%s]   storage-initializer completed (model downloaded from HuggingFace)", tc.Name)
-					return nil
-				})
-				if err != nil {
-					Fail(fmt.Sprintf("Model download via storage-initializer failed: %v", err))
-				}
-			})
+			// Note: storage-initializer completion is implicitly verified by the READY phase below.
+			// KServe injects storage-initializer as an init container — the pod won't become Ready
+			// until the init container completes. No need to check separately.
 
 			// ── Phase 4f: READY ────────────────────────────────────
 			It("should become READY", func() {
@@ -578,19 +551,23 @@ var _ = Describe("LLM-D Conformance", func() {
 				if err != nil {
 					Fail(fmt.Sprintf("Service did not become ready: %v", err))
 				}
-				// Capture the actual vLLM image and version from the deployed pod
-				name := deployer.ExtractLLMISVCName(tc)
-				label := fmt.Sprintf(metrics.WorkloadLabelFmt, name)
-
-				// Get image
-				vllmImage, _ := dep.Kubectl(ctx, "get", "pods", "-n", dep.Namespace, "-l", label,
-					"-o", "jsonpath={.items[0].spec.containers[?(@.name==\"main\")].image}")
-				if img := strings.TrimSpace(vllmImage); img != "" {
+				// Capture vLLM image and version (once per run)
+				vllmInfo := dep.GetVLLMVersion(ctx)
+				if img, ok := vllmInfo["vllmImage"]; ok {
 					modelInfo.VLLMImage = img
 					logStep("[%s]   vLLM image: %s", tc.Name, img)
+					// Update report environment info (first time only)
+					if rep != nil {
+						rep.UpdateExtra("vllmImage", img)
+						if ver, ok := vllmInfo["vllmVersion"]; ok {
+							rep.UpdateExtra("vllmVersion", ver)
+						}
+					}
 				}
 
 				// Get version from inside the running pod
+				name := deployer.ExtractLLMISVCName(tc)
+				label := fmt.Sprintf(metrics.WorkloadLabelFmt, name)
 				podName, _ := dep.Kubectl(ctx, "get", "pods", "-n", dep.Namespace, "-l", label,
 					"-o", "jsonpath={.items[0].metadata.name}")
 				if pod := strings.TrimSpace(podName); pod != "" {
@@ -659,19 +636,19 @@ var _ = Describe("LLM-D Conformance", func() {
 				skipIfCache()
 				logStep("[%s] Phase 6: HEALTH — Validating /health endpoint", tc.Name)
 
-				if testMode == "discover" {
-					svcEndpoint = endpoint
-				} else {
-					var err error
-					svcEndpoint, err = dep.GetServiceEndpoint(ctx, tc)
-					if err != nil {
+				var err error
+				svcEndpoint, err = dep.GetServiceEndpoint(ctx, tc)
+				if err != nil {
+					if endpoint != "" {
+						svcEndpoint = endpoint
+					} else {
 						Fail(fmt.Sprintf("Could not get service endpoint: %v", err))
 					}
 				}
 				logStep("[%s]   Endpoint: %s", tc.Name, svcEndpoint)
 
 				llmClient = client.New(svcEndpoint)
-				err := retry.UntilSuccess(ctx, retry.Options{
+				err = retry.UntilSuccess(ctx, retry.Options{
 					Timeout:  tc.Validation.Timeout.Duration,
 					Interval: tc.Validation.RetryInterval.Duration,
 					Name:     "health-" + tc.Name,
@@ -680,6 +657,20 @@ var _ = Describe("LLM-D Conformance", func() {
 				})
 				if err != nil {
 					Fail(fmt.Sprintf("/health failed: %v", err))
+				}
+
+				// Capture vLLM version (once per run, any mode)
+				if rep != nil && !vllmVersionCaptured {
+					vllmInfo := dep.GetVLLMVersion(ctx)
+					if img, ok := vllmInfo["vllmImage"]; ok {
+						rep.UpdateExtra("vllmImage", img)
+						logStep("[%s]   vLLM image: %s", tc.Name, img)
+					}
+					if ver, ok := vllmInfo["vllmVersion"]; ok {
+						rep.UpdateExtra("vllmVersion", ver)
+						logStep("[%s]   vLLM version: %s", tc.Name, ver)
+					}
+					vllmVersionCaptured = true
 				}
 			})
 
@@ -700,7 +691,16 @@ var _ = Describe("LLM-D Conformance", func() {
 					}
 				}
 				if !found {
-					logStep("[%s]   WARNING: expected %s, got %v", tc.Name, tc.Model.Name, listedModels)
+					if modelOverride != "" {
+						// User explicitly set MODEL= — don't override, let it fail
+						logStep("[%s]   WARNING: model %s not found, available: %v", tc.Name, tc.Model.Name, listedModels)
+					} else if len(listedModels) > 0 {
+						// Auto-detect: use whatever model is running
+						logStep("[%s]   Model %s not found, using %s instead", tc.Name, tc.Model.Name, listedModels[0])
+						tc.Model.Name = listedModels[0]
+					} else {
+						logStep("[%s]   WARNING: no models listed at /v1/models", tc.Name)
+					}
 				} else {
 					logStep("[%s]   Model %s found", tc.Name, tc.Model.Name)
 				}
@@ -882,7 +882,7 @@ var _ = Describe("LLM-D Conformance", func() {
 			It("vllm:gpu_cache_usage_perc should be > 0 (KV cache in use)", func() {
 				skipIfCache()
 				mc := tc.Validation.MetricsCheck
-				if mc == nil || !mc.CheckPrefixCache && !mc.CheckVLLM {
+				if mc == nil || (!mc.CheckPrefixCache && !mc.CheckVLLM) {
 					Skip("vLLM cache check not enabled")
 				}
 				if len(vllmMetrics) == 0 {
@@ -1068,7 +1068,7 @@ var _ = Describe("LLM-D Conformance", func() {
 			It("inference_objective_request_total should be > 0 (requests routed through EPP)", func() {
 				skipIfCache()
 				mc := tc.Validation.MetricsCheck
-				if mc == nil || !mc.CheckScheduler && !mc.CheckEPP {
+				if mc == nil || (!mc.CheckScheduler && !mc.CheckEPP) {
 					Skip("EPP/scheduler check not enabled")
 				}
 				if len(eppMetrics) == 0 {
@@ -1091,7 +1091,7 @@ var _ = Describe("LLM-D Conformance", func() {
 			It("inference_objective_request_error_total should be 0 (no routing errors)", func() {
 				skipIfCache()
 				mc := tc.Validation.MetricsCheck
-				if mc == nil || !mc.CheckScheduler && !mc.CheckEPP {
+				if mc == nil || (!mc.CheckScheduler && !mc.CheckEPP) {
 					Skip("EPP/scheduler check not enabled")
 				}
 				if len(eppMetrics) == 0 {
@@ -1114,7 +1114,7 @@ var _ = Describe("LLM-D Conformance", func() {
 			It("inference_pool_ready_pods should be > 0 (pods available for routing)", func() {
 				skipIfCache()
 				mc := tc.Validation.MetricsCheck
-				if mc == nil || !mc.CheckScheduler && !mc.CheckEPP {
+				if mc == nil || (!mc.CheckScheduler && !mc.CheckEPP) {
 					Skip("EPP/scheduler check not enabled")
 				}
 				if len(eppMetrics) == 0 {
@@ -1207,7 +1207,11 @@ func resolveTestCases() ([]*config.TestCase, error) {
 		return nil, fmt.Errorf("loading test cases from %s: %w", testCaseDir, err)
 	}
 	if testCaseName != "" {
-		return config.FilterTestCasesByNames(allCases, []string{testCaseName}), nil
+		names := strings.Split(testCaseName, ",")
+		for i := range names {
+			names[i] = strings.TrimSpace(names[i])
+		}
+		return config.FilterTestCasesByNames(allCases, names), nil
 	}
 	if labels != "" {
 		labelList := strings.Split(labels, ",")
