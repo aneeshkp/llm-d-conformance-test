@@ -46,6 +46,8 @@ var _ = BeforeSuite(func() {
 
 	// Create deployer
 	dep = deployer.New(kubeconfig, p, namespace)
+	dep.MockImage = mockImage
+	dep.PullSecretName = pullSecretName
 	dep.LogFunc = func(format string, args ...interface{}) {
 		fmt.Fprintf(os.Stderr, format+"\n", args...)
 	}
@@ -509,32 +511,68 @@ var _ = Describe("LLM-D Conformance", func() {
 				skipIfDiscover()
 				skipIfCache()
 				name := deployer.ExtractLLMISVCName(tc)
-				logStep("[%s] Checking pods", tc.Name)
+				logStep("[%s] Checking pods (waiting for Running state, detecting crashes)", tc.Name)
 
 				err := retry.UntilSuccess(ctx, retry.Options{
-					Timeout:  3 * time.Minute,
+					Timeout:  5 * time.Minute,
 					Interval: 10 * time.Second,
 					Name:     "pods-" + name,
 				}, func() error {
-					out, _ := dep.GetPodStatus(ctx, name, dep.Namespace)
+					// Get pod status: name, phase, ready, restarts
+					out, _ := dep.Kubectl(ctx, "get", "pods", "-n", dep.Namespace, "-l",
+						fmt.Sprintf("app.kubernetes.io/name=%s", name),
+						"-o", "jsonpath={range .items[*]}{.metadata.name} phase={.status.phase} ready={.status.containerStatuses[0].ready} restarts={.status.containerStatuses[0].restartCount} reason={.status.containerStatuses[0].state.waiting.reason}{\"\\n\"}{end}")
 					pods := strings.TrimSpace(out)
 					if pods == "" {
-						return fmt.Errorf("no pods found for %s", name)
+						return fmt.Errorf("no pods found yet for %s", name)
 					}
+					fetchLogs := func(podName string) string {
+						logs, _ := dep.Kubectl(ctx, "logs", podName, "-n", dep.Namespace, "--tail=10", "--all-containers=true")
+						return strings.TrimSpace(logs)
+					}
+
+					allRunning := true
 					for _, line := range strings.Split(pods, "\n") {
-						if strings.Contains(line, "restarts=") {
-							parts := strings.Split(line, "restarts=")
-							if len(parts) > 1 && parts[1] != "0" && parts[1] != "" {
-								logs, _ := dep.GetPodLogs(ctx, name, dep.Namespace, 10)
-								Fail(fmt.Sprintf("Pod crash detected: %s\nLogs:\n%s", line, logs))
-							}
+						line = strings.TrimSpace(line)
+						if line == "" {
+							continue
 						}
 						logStep("[%s]   %s", tc.Name, line)
+
+						// Parse fields from the jsonpath output
+						fields := make(map[string]string)
+						for _, part := range strings.Fields(line) {
+							if k, v, ok := strings.Cut(part, "="); ok {
+								fields[k] = v
+							}
+						}
+						podName := strings.Fields(line)[0]
+
+						// Detect crashes immediately via reason field
+						reason := fields["reason"]
+						if reason == "CrashLoopBackOff" || reason == "Error" || reason == "CreateContainerError" {
+							Fail(fmt.Sprintf("Pod crash detected: %s\nLogs:\n%s", line, fetchLogs(podName)))
+						}
+
+						// Check restarts > 1 (allow 0-1 for init)
+						if count := fields["restarts"]; count != "" && count != "0" && count != "1" {
+							Fail(fmt.Sprintf("Pod restarting (restarts=%s): %s\nLogs:\n%s", count, line, fetchLogs(podName)))
+						}
+
+						if fields["phase"] != "Running" {
+							allRunning = false
+						}
+					}
+					if !allRunning {
+						return fmt.Errorf("not all pods Running yet")
 					}
 					return nil
 				})
 				if err != nil {
-					Fail(fmt.Sprintf("Pods not running: %v", err))
+					// On timeout, get detailed pod description
+					desc, _ := dep.Kubectl(ctx, "describe", "pods", "-n", dep.Namespace, "-l",
+						fmt.Sprintf("app.kubernetes.io/name=%s", name))
+					Fail(fmt.Sprintf("Pods not running after timeout: %v\n\nPod details:\n%s", err, strings.TrimSpace(desc)))
 				}
 			})
 
@@ -783,6 +821,9 @@ var _ = Describe("LLM-D Conformance", func() {
 			// ── Phase 8: METRICS — Scrape ─────────────────────────
 			It("should scrape metrics from pods", func() {
 				skipIfCache()
+				if mockImage != "" {
+					Skip("mock mode — no real vLLM metrics")
+				}
 				mc := tc.Validation.MetricsCheck
 				if mc == nil || !mc.Enabled {
 					Skip("metricsCheck not enabled")
@@ -951,8 +992,8 @@ var _ = Describe("LLM-D Conformance", func() {
 			It("vllm:generation_tokens_total should be > 0 (decode pods generating tokens)", func() {
 				skipIfCache()
 				mc := tc.Validation.MetricsCheck
-				if mc == nil || !mc.CheckPD {
-					Skip("P/D check not enabled")
+				if mc == nil || !mc.CheckVLLM {
+					Skip("vLLM check not enabled")
 				}
 				if len(vllmMetrics) == 0 {
 					Skip("no vLLM metrics scraped")
@@ -974,8 +1015,8 @@ var _ = Describe("LLM-D Conformance", func() {
 			It("vllm:request_success_total should be > 0 (requests completed)", func() {
 				skipIfCache()
 				mc := tc.Validation.MetricsCheck
-				if mc == nil || !mc.CheckPD {
-					Skip("P/D check not enabled")
+				if mc == nil || !mc.CheckVLLM {
+					Skip("vLLM check not enabled")
 				}
 				if len(vllmMetrics) == 0 {
 					Skip("no vLLM metrics scraped")
