@@ -29,6 +29,8 @@ type Deployer struct {
 	Platform    Platform
 	Namespace   string
 	ModelSource string // "pvc", "hf", or "pvc-snapshot"
+	MockImage      string // if set, replace vLLM image with mock and remove GPU resources
+	PullSecretName string // override pull secret name to copy (default: auto-detect from manifest)
 	// LogFunc is called with progress messages. If nil, progress is silent.
 	LogFunc func(format string, args ...interface{})
 }
@@ -75,6 +77,11 @@ func (d *Deployer) Deploy(ctx context.Context, tc *config.TestCase) *DeployResul
 		return result
 	}
 	result.Logs = append(result.Logs, fmt.Sprintf("Namespace %s ready", ns))
+
+	// Copy image pull secrets referenced in the manifest from istio-system
+	if err := d.ensurePullSecrets(ctx, tc.Deployment.ManifestPath, ns); err != nil {
+		d.logProgress("  Warning: failed to copy pull secrets: %v", err)
+	}
 
 	// Apply the manifest
 	manifestPath := tc.Deployment.ManifestPath
@@ -436,6 +443,97 @@ func (d *Deployer) ensureNamespace(ctx context.Context, ns string) error {
 	return err
 }
 
+// ensurePullSecrets reads the manifest for imagePullSecrets references and copies
+// them from istio-system into the target namespace if they don't already exist.
+func (d *Deployer) ensurePullSecrets(ctx context.Context, manifestPath, ns string) error {
+	// OCP clusters have pull secrets configured globally — no need to copy
+	if d.Platform == PlatformOCP {
+		return nil
+	}
+
+	seen := map[string]bool{}
+
+	// If an explicit pull secret name is set, use that; otherwise auto-detect from manifest
+	if d.PullSecretName != "" {
+		seen[d.PullSecretName] = true
+	} else {
+		data, err := os.ReadFile(manifestPath)
+		if err != nil {
+			return fmt.Errorf("reading manifest: %w", err)
+		}
+		// Parse secret names from "- name: <secret>" lines under imagePullSecrets
+		lines := strings.Split(string(data), "\n")
+		inPullSecrets := false
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "imagePullSecrets:" {
+				inPullSecrets = true
+				continue
+			}
+			if inPullSecrets {
+				if strings.HasPrefix(trimmed, "- name: ") {
+					name := strings.TrimPrefix(trimmed, "- name: ")
+					seen[name] = true
+					continue
+				}
+				inPullSecrets = false
+			}
+		}
+	}
+
+	sourceNamespaces := []string{"istio-system", "kserve", "opendatahub"}
+	for secretName := range seen {
+		// Skip if already exists in target namespace
+		if _, err := d.Kubectl(ctx, "get", "secret", secretName, "-n", ns); err == nil {
+			continue
+		}
+
+		// Try to copy from known source namespaces
+		copied := false
+		for _, srcNS := range sourceNamespaces {
+			if _, err := d.Kubectl(ctx, "get", "secret", secretName, "-n", srcNS); err != nil {
+				continue
+			}
+			// Get the secret and re-apply in target namespace
+			secretYAML, err := d.Kubectl(ctx, "get", "secret", secretName, "-n", srcNS, "-o", "yaml")
+			if err != nil {
+				continue
+			}
+			// Replace namespace and strip cluster-specific metadata
+			secretYAML = strings.ReplaceAll(secretYAML, "namespace: "+srcNS, "namespace: "+ns)
+			// Remove resourceVersion, uid, creationTimestamp so it can be created fresh
+			var cleanLines []string
+			for _, l := range strings.Split(secretYAML, "\n") {
+				t := strings.TrimSpace(l)
+				if strings.HasPrefix(t, "resourceVersion:") ||
+					strings.HasPrefix(t, "uid:") ||
+					strings.HasPrefix(t, "creationTimestamp:") {
+					continue
+				}
+				cleanLines = append(cleanLines, l)
+			}
+			tmpFile, err := os.CreateTemp("", "pull-secret-*.yaml")
+			if err != nil {
+				return fmt.Errorf("creating temp file: %w", err)
+			}
+			_, _ = tmpFile.WriteString(strings.Join(cleanLines, "\n"))
+			_ = tmpFile.Close()
+			_, err = d.Kubectl(ctx, "apply", "-n", ns, "-f", tmpFile.Name())
+			_ = os.Remove(tmpFile.Name())
+			if err != nil {
+				continue
+			}
+			d.logProgress("  Copied pull secret %s from %s to %s", secretName, srcNS, ns)
+			copied = true
+			break
+		}
+		if !copied {
+			return fmt.Errorf("pull secret %q not found in any of %v", secretName, sourceNamespaces)
+		}
+	}
+	return nil
+}
+
 // Kubectl runs a kubectl command with the deployer's kubeconfig and platform settings.
 func (d *Deployer) Kubectl(ctx context.Context, args ...string) (string, error) {
 	cmdArgs := make([]string, 0, len(args)+2)
@@ -488,6 +586,72 @@ func (d *Deployer) patchManifest(manifestPath string, tc *config.TestCase) (stri
 				patched = true
 			}
 		}
+	}
+
+	// Mock mode: replace main vLLM container with mock image (no GPU, no model download)
+	// Only patches under spec.template.containers, NOT spec.router.scheduler.template.containers
+	if d.MockImage != "" {
+		var newLines []string
+		skip := false
+		containerIndent := 0
+		inSchedulerTemplate := false
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			lineIndent := len(line) - len(strings.TrimLeft(line, " "))
+
+			// Track if we're inside the scheduler template section
+			if trimmed == "scheduler:" || strings.HasPrefix(trimmed, "scheduler: ") {
+				inSchedulerTemplate = true
+			}
+			// spec.template / spec.prefill.template are at lower indent than scheduler.template
+			if trimmed == "template:" && !inSchedulerTemplate {
+				// Already outside scheduler — keep as false
+			} else if trimmed == "template:" && lineIndent <= 4 {
+				inSchedulerTemplate = false
+			}
+
+			// Replace all "- name: main" under spec.template and spec.prefill.template, not scheduler.template
+			if trimmed == "- name: main" && !inSchedulerTemplate {
+				containerIndent = lineIndent
+				skip = true
+				indent := strings.Repeat(" ", containerIndent)
+				newLines = append(newLines,
+					indent+"- name: main",
+					indent+"  image: "+d.MockImage,
+					indent+"  imagePullPolicy: Always",
+					indent+"  command: [\"python3\"]",
+					indent+"  args: [\"/app/server.py\"]",
+					indent+"  resources:",
+					indent+"    limits:",
+					indent+"      cpu: \"500m\"",
+					indent+"      memory: 128Mi",
+					indent+"    requests:",
+					indent+"      cpu: \"100m\"",
+					indent+"      memory: 64Mi",
+				)
+				patched = true
+				continue
+			}
+
+			if skip {
+				if trimmed != "" && lineIndent <= containerIndent {
+					skip = false
+				} else {
+					continue
+				}
+			}
+
+			newLines = append(newLines, line)
+		}
+		// Filter empty lines left behind by container block removal
+		var filteredLines []string
+		for _, line := range newLines {
+			if line != "" {
+				filteredLines = append(filteredLines, line)
+			}
+		}
+		lines = filteredLines
+		d.logProgress("  Mock mode: using image %s (no GPU)", d.MockImage)
 	}
 
 	if !patched {

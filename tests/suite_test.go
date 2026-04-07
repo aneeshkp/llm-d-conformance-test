@@ -28,6 +28,8 @@ var (
 	modelSource   string // "pvc" (default) or "hf"
 	modelOverride string // override model repo ID (e.g., "Qwen/Qwen3-0.6B")
 	noCleanup     bool
+	mockImage      string // mock vLLM image for testing without GPU
+	pullSecretName string // override pull secret name to copy into namespace
 )
 
 func init() {
@@ -46,6 +48,8 @@ func init() {
 	flag.StringVar(&modelSource, "model-source", "hf", "Model source: 'hf' (HuggingFace direct, default) or 'pvc' (download to PVC first)")
 	flag.StringVar(&modelOverride, "model", "", "Override model repo ID (e.g., Qwen/Qwen3-0.6B)")
 	flag.BoolVar(&noCleanup, "nocleanup", false, "Skip cleanup after tests (leave resources running for debugging)")
+	flag.StringVar(&mockImage, "mock", "", "Mock vLLM image for testing without GPU (e.g., ghcr.io/aneeshkp/vllm-mock:latest)")
+	flag.StringVar(&pullSecretName, "pull-secret", "", "Pull secret name to copy into test namespace (default: auto-detect from manifest)")
 }
 
 // findRootDir walks up from the current working directory to find the project root (containing go.mod).

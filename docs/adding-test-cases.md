@@ -34,6 +34,8 @@ spec:
     route: {}
     gateway: {}
   template:
+    imagePullSecrets:
+    - name: redhat-pull-secret
     containers:
       - name: main
         resources:
@@ -66,6 +68,7 @@ Customize based on what you're testing:
 | Data/Expert parallelism | Add `parallelism:` section |
 | RDMA/RoCE | Add network annotations and `rdma/roce_gdr` resources |
 | Multiple GPUs | Set `nvidia.com/gpu: "8"` in resources |
+| Pull secrets | Add `imagePullSecrets` under `template` (auto-copied from `istio-system` at deploy time) |
 
 Push to the manifest repo, then run `make setup` to pull the new manifest.
 
@@ -116,6 +119,7 @@ cleanup: true
 | `name` | Unique test case name (used with `TESTCASE=`) |
 | `model.name` | HuggingFace model ID — can be overridden with `MODEL=` |
 | `model.uri` | Base model URI (framework patches this based on `MODEL_SOURCE`) |
+| `model.category` | Groups test cases in `make testcases`: `single-node-gpu`, `cache-aware`, `multi-node-gpu`, `deepseek` |
 | `model.cache.storageSize` | PVC size — can be overridden with `STORAGE_SIZE=` |
 | `deployment.manifestPath` | Manifest filename (looked up in `deploy/manifests/`) |
 | `deployment.readyTimeout` | Max wait for `LLMInferenceService` to become READY |
@@ -154,7 +158,7 @@ validation:
 Add the test case name to a profile in `configs/profiles/`:
 
 ```yaml
-# configs/profiles/full.yaml
+# configs/profiles/all.yaml
 testCases:
   - single-gpu
   - my-new-test          # add here
@@ -192,6 +196,9 @@ make test TESTCASE=my-new-test MODEL=Qwen/Qwen2.5-7B-Instruct
 # Pre-cache model, then run with PVC
 make cache-model TESTCASE=my-new-test
 make test TESTCASE=my-new-test MODEL_SOURCE=pvc
+
+# Run with mock image (no GPU required)
+make test TESTCASE=my-new-test MOCK=ghcr.io/aneeshkp/vllm-mock:latest
 ```
 
 ## File checklist

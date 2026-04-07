@@ -20,6 +20,8 @@ MODEL_SOURCE ?= hf
 MODEL ?=
 NO_CLEANUP ?=
 DISCOVER ?=
+MOCK ?=
+PULL_SECRET ?=
 
 # Build flags
 GO_TEST_FLAGS ?= -v
@@ -57,6 +59,12 @@ endif
 ifdef DISCOVER
   TEST_FLAGS += -mode=discover
 endif
+ifdef MOCK
+  TEST_FLAGS += -mock=$(MOCK)
+endif
+ifdef PULL_SECRET
+  TEST_FLAGS += -pull-secret=$(PULL_SECRET)
+endif
 
 .PHONY: help
 help: ## Show this help
@@ -79,6 +87,10 @@ help: ## Show this help
 	@printf '  \033[33m%-25s\033[0m %s\n' "" "make test TESTCASE=single-gpu NO_CLEANUP=1"
 	@printf '  \033[36m%-25s\033[0m %s\n' "DISCOVER" "Validate existing deployment (skip deploy/cleanup)"
 	@printf '  \033[33m%-25s\033[0m %s\n' "" "make test TESTCASE=single-gpu DISCOVER=true NAMESPACE=my-ns"
+	@printf '  \033[36m%-25s\033[0m %s\n' "MOCK" "Mock vLLM image for testing without GPU"
+	@printf '  \033[33m%-25s\033[0m %s\n' "" "make test TESTCASE=single-gpu MOCK=ghcr.io/aneeshkp/vllm-mock:latest"
+	@printf '  \033[36m%-25s\033[0m %s\n' "PULL_SECRET" "Pull secret name to copy into namespace (default: auto-detect)"
+	@printf '  \033[33m%-25s\033[0m %s\n' "" "make test TESTCASE=single-gpu PULL_SECRET=my-registry-secret"
 	@printf '  \033[36m%-25s\033[0m %s\n' "STORAGE_CLASS" "StorageClass for PVCs (default: cluster default)"
 	@printf '  \033[33m%-25s\033[0m %s\n' "" "make cache-model TESTCASE=single-gpu STORAGE_CLASS=azurefile-rwx"
 	@printf '  \033[36m%-25s\033[0m %s\n' "STORAGE_SIZE" "Override PVC storage size (default: from test case config)"
@@ -288,6 +300,9 @@ testcases: ## List available test cases grouped by category
 	@echo ""
 	@echo "Discover (validate existing deployment):"
 	@echo "  make test TESTCASE=single-gpu DISCOVER=true NAMESPACE=my-ns"
+	@echo ""
+	@echo "Mock mode (no GPU required):"
+	@echo "  make test TESTCASE=single-gpu MOCK=ghcr.io/aneeshkp/vllm-mock:latest"
 	@echo ""
 
 .PHONY: models

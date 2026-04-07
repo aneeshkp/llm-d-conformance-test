@@ -144,6 +144,32 @@ make test TESTCASE=single-gpu DISCOVER=true NAMESPACE=my-ns
 make test-profile-all DISCOVER=true NAMESPACE=my-ns
 ```
 
+## Mock Mode
+
+Test the full framework lifecycle **without GPUs or real models**. The deployer replaces the vLLM container in each manifest with a lightweight mock image that serves the OpenAI-compatible API.
+
+```bash
+# Run with mock image (no GPU required)
+make test TESTCASE=single-gpu MOCK=ghcr.io/aneeshkp/vllm-mock:latest
+
+# Works with any test case
+make test TESTCASE=pd MOCK=ghcr.io/aneeshkp/vllm-mock:latest
+
+# Combine with other flags
+make test-profile-all MOCK=ghcr.io/aneeshkp/vllm-mock:latest NO_CLEANUP=1
+```
+
+What mock mode does:
+- Replaces the `main` container in `spec.template` and `spec.prefill.template` with the mock image
+- Removes GPU resource requests/limits (uses minimal CPU/memory instead)
+- Skips the metrics scraping phase (mock doesn't expose real vLLM metrics)
+- Scheduler containers are **not** replaced — they run as normal
+
+This is useful for:
+- CI/CD pipelines on clusters without GPUs
+- Testing framework changes without waiting for model downloads
+- Validating manifest structure and KServe operator behavior
+
 ## Configuration
 
 ### Flags
@@ -154,6 +180,8 @@ make test-profile-all DISCOVER=true NAMESPACE=my-ns
 | `MODEL` | — | Override model (e.g., `Qwen/Qwen2.5-7B-Instruct`) |
 | `MODEL_SOURCE` | `hf` | `hf` (HuggingFace direct) or `pvc` (pre-cached) |
 | `MANIFEST_REF` | `main` | Manifest repo branch (e.g., `3.4-ea1`, `3.4-ea2`) |
+| `MOCK` | — | Mock vLLM image (e.g., `ghcr.io/aneeshkp/vllm-mock:latest`) |
+| `PULL_SECRET` | auto-detect | Pull secret name to copy into namespace (skipped on OCP) |
 | `NO_CLEANUP` | — | Set to `1` to keep resources after test |
 | `DISCOVER` | — | Set to `true` to validate existing deployment (skip deploy/cleanup) |
 | `STORAGE_CLASS` | cluster default | StorageClass for PVCs |
