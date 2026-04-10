@@ -14,7 +14,8 @@ import (
 
 // LLMClient talks to an OpenAI-compatible LLM inference endpoint.
 type LLMClient struct {
-	BaseURL    string
+	BaseURL     string
+	BearerToken string
 	HTTPClient *http.Client
 }
 
@@ -31,6 +32,12 @@ func New(baseURL string) *LLMClient {
 	}
 }
 
+func (c *LLMClient) setAuth(req *http.Request) {
+	if c.BearerToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.BearerToken)
+	}
+}
+
 // HealthCheck hits the /health endpoint and returns nil if healthy.
 func (c *LLMClient) HealthCheck(ctx context.Context) error {
 	url := c.BaseURL + "/health"
@@ -38,6 +45,7 @@ func (c *LLMClient) HealthCheck(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("creating health request: %w", err)
 	}
+	c.setAuth(req)
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("health check request failed: %w", err)
@@ -159,6 +167,7 @@ func (c *LLMClient) ListModels(ctx context.Context) (*ModelsResponse, error) {
 	if err != nil {
 		return nil, fmt.Errorf("creating models request: %w", err)
 	}
+	c.setAuth(req)
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("models request failed: %w", err)
@@ -189,6 +198,7 @@ func (c *LLMClient) post(ctx context.Context, path string, reqBody, respBody int
 		return fmt.Errorf("creating request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	c.setAuth(req)
 
 	resp, err := c.HTTPClient.Do(req)
 	if err != nil {
