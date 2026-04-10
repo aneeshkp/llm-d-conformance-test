@@ -407,7 +407,7 @@ var _ = Describe("LLM-D Conformance", func() {
 					Name:     "gateway-programmed",
 				}, func() error {
 					// Find gateway referenced by the LLMInferenceService (check common namespaces)
-					for _, gwNS := range []string{"opendatahub", "kserve", "istio-system", dep.Namespace} {
+					for _, gwNS := range []string{"opendatahub", "kserve", "istio-system", "redhat-ods-applications", dep.Namespace} {
 						out, err := dep.Kubectl(ctx, "get", "gateway", "-n", gwNS,
 							"-o", "jsonpath={range .items[*]}{.metadata.name}|{.status.conditions[?(@.type==\"Programmed\")].status}|{.status.addresses[0].value}{\"\\n\"}{end}")
 						if err != nil || strings.TrimSpace(out) == "" {

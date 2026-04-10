@@ -363,7 +363,7 @@ func (d *Deployer) GetPlatformInfo(ctx context.Context) map[string]string {
 	}
 
 	// KServe version — from the controller deployment image tag
-	for _, ns := range []string{"opendatahub", "kserve", "kserve-system"} {
+	for _, ns := range []string{"opendatahub", "redhat-ods-applications", "kserve", "kserve-system"} {
 		output, err := d.Kubectl(ctx, "get", "deployment", "-n", ns, "-l",
 			"control-plane=kserve-controller-manager",
 			"-o", "jsonpath={.items[0].spec.template.spec.containers[0].image}")
@@ -378,7 +378,7 @@ func (d *Deployer) GetPlatformInfo(ctx context.Context) map[string]string {
 	}
 
 	// vLLM image — from the inferenceservice-config configmap
-	for _, ns := range []string{"opendatahub", "kserve", "kserve-system"} {
+	for _, ns := range []string{"opendatahub", "redhat-ods-applications", "kserve", "kserve-system"} {
 		output, err := d.Kubectl(ctx, "get", "configmap", "inferenceservice-config", "-n", ns,
 			"-o", "jsonpath={.data.storageInitializer}")
 		if err == nil && strings.TrimSpace(output) != "" {
@@ -481,7 +481,7 @@ func (d *Deployer) ensurePullSecrets(ctx context.Context, manifestPath, ns strin
 		}
 	}
 
-	sourceNamespaces := []string{"istio-system", "kserve", "opendatahub"}
+	sourceNamespaces := []string{"istio-system", "kserve", "opendatahub", "redhat-ods-applications"}
 	for secretName := range seen {
 		// Skip if already exists in target namespace
 		if _, err := d.Kubectl(ctx, "get", "secret", secretName, "-n", ns); err == nil {
@@ -585,6 +585,30 @@ func (d *Deployer) patchManifest(manifestPath string, tc *config.TestCase) (stri
 				lines[i] = fmt.Sprintf("%sname: %s", indent, tc.Model.Name)
 				patched = true
 			}
+		}
+	}
+
+	// Patch imagePullSecrets name if overridden
+	if d.PullSecretName != "" {
+		inPullSecrets := false
+		for i, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "imagePullSecrets:" {
+				inPullSecrets = true
+				continue
+			}
+			if inPullSecrets {
+				if strings.HasPrefix(trimmed, "- name: ") {
+					indent := line[:len(line)-len(strings.TrimLeft(line, " "))]
+					lines[i] = fmt.Sprintf("%s- name: %s", indent, d.PullSecretName)
+					patched = true
+					continue
+				}
+				inPullSecrets = false
+			}
+		}
+		if patched {
+			d.logProgress("  Patched imagePullSecrets to use %s", d.PullSecretName)
 		}
 	}
 
