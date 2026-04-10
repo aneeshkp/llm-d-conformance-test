@@ -30,6 +30,8 @@ var (
 	noCleanup     bool
 	mockImage      string // mock vLLM image for testing without GPU
 	pullSecretName string // override pull secret name to copy into namespace
+	bearerToken    string // bearer token for authenticated inference endpoints
+	disableAuth    bool   // disable auth on llmisvc (for disconnected clusters with broken WASM)
 )
 
 func init() {
@@ -50,6 +52,8 @@ func init() {
 	flag.BoolVar(&noCleanup, "nocleanup", false, "Skip cleanup after tests (leave resources running for debugging)")
 	flag.StringVar(&mockImage, "mock", "", "Mock vLLM image for testing without GPU (e.g., ghcr.io/aneeshkp/vllm-mock:latest)")
 	flag.StringVar(&pullSecretName, "pull-secret", "", "Pull secret name to copy into test namespace (default: auto-detect from manifest)")
+	flag.StringVar(&bearerToken, "bearer-token", "", "Bearer token for authenticated inference endpoints (e.g., OCP service account token)")
+	flag.BoolVar(&disableAuth, "disable-auth", false, "Disable auth on llmisvc (injects security.opendatahub.io/enable-auth=false)")
 }
 
 // findRootDir walks up from the current working directory to find the project root (containing go.mod).
