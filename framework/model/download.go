@@ -523,7 +523,7 @@ func (dl *Downloader) jobName(pvcName string) string {
 // Falls back to a default if the configmap is not found.
 func (dl *Downloader) getStorageInitImage(ctx context.Context) string {
 	// Try to read from KServe configmap (works for both opendatahub and kserve namespaces)
-	for _, ns := range []string{"opendatahub", "kserve", "knative-serving"} {
+	for _, ns := range []string{"opendatahub", "redhat-ods-applications", "kserve", "knative-serving"} {
 		bin := "kubectl"
 		args := []string{}
 		if dl.kubeconfig != "" {
