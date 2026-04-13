@@ -48,6 +48,7 @@ var _ = BeforeSuite(func() {
 	dep = deployer.New(kubeconfig, p, namespace)
 	dep.MockImage = mockImage
 	dep.PullSecretName = pullSecretName
+	dep.DisableAuth = disableAuth
 	dep.LogFunc = func(format string, args ...interface{}) {
 		fmt.Fprintf(os.Stderr, format+"\n", args...)
 	}
@@ -407,7 +408,7 @@ var _ = Describe("LLM-D Conformance", func() {
 					Name:     "gateway-programmed",
 				}, func() error {
 					// Find gateway referenced by the LLMInferenceService (check common namespaces)
-					for _, gwNS := range []string{"opendatahub", "kserve", "istio-system", "redhat-ods-applications", dep.Namespace} {
+					for _, gwNS := range []string{"opendatahub", "kserve", "istio-system", "redhat-ods-applications", "openshift-ingress", dep.Namespace} {
 						out, err := dep.Kubectl(ctx, "get", "gateway", "-n", gwNS,
 							"-o", "jsonpath={range .items[*]}{.metadata.name}|{.status.conditions[?(@.type==\"Programmed\")].status}|{.status.addresses[0].value}{\"\\n\"}{end}")
 						if err != nil || strings.TrimSpace(out) == "" {
@@ -632,6 +633,13 @@ var _ = Describe("LLM-D Conformance", func() {
 				skipIfDiscover()
 				skipIfCache()
 				name := deployer.ExtractLLMISVCName(tc)
+				// Skip if storage-initializer was not used (mock mode, RunAI Streamer, etc.)
+				initOut, _ := dep.Kubectl(ctx, "get", "pods", "-n", dep.Namespace, "-l",
+					fmt.Sprintf("app.kubernetes.io/name=%s", name),
+					"-o", "jsonpath={.items[0].spec.initContainers[*].name}")
+				if !strings.Contains(initOut, "storage-initializer") {
+					Skip("no storage-initializer init container — model files not expected")
+				}
 				logStep("[%s] Checking model files at /mnt/models", tc.Name)
 
 				// Get pod name first, then exec into it
@@ -675,17 +683,23 @@ var _ = Describe("LLM-D Conformance", func() {
 				logStep("[%s] Phase 6: HEALTH — Validating /health endpoint", tc.Name)
 
 				var err error
-				svcEndpoint, err = dep.GetServiceEndpoint(ctx, tc)
-				if err != nil {
-					if endpoint != "" {
-						svcEndpoint = endpoint
-					} else {
+				if endpoint != "" {
+					// Append namespace/name path prefix for gateway routing
+					name := deployer.ExtractLLMISVCName(tc)
+					svcEndpoint = fmt.Sprintf("%s/%s/%s", strings.TrimRight(endpoint, "/"), dep.Namespace, name)
+				} else {
+					svcEndpoint, err = dep.GetServiceEndpoint(ctx, tc)
+					if err != nil {
 						Fail(fmt.Sprintf("Could not get service endpoint: %v", err))
 					}
 				}
 				logStep("[%s]   Endpoint: %s", tc.Name, svcEndpoint)
 
 				llmClient = client.New(svcEndpoint)
+				llmClient.BearerToken = bearerToken
+				if bearerToken != "" {
+					logStep("[%s]   Bearer token set (%d chars)", tc.Name, len(bearerToken))
+				}
 				err = retry.UntilSuccess(ctx, retry.Options{
 					Timeout:  tc.Validation.Timeout.Duration,
 					Interval: tc.Validation.RetryInterval.Duration,

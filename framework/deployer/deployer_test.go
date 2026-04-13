@@ -1,6 +1,7 @@
 package deployer
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
@@ -361,7 +362,7 @@ spec:
 			manifestPath := createManifest(t, tt.manifest)
 			d := &Deployer{}
 
-			resultPath, err := d.patchManifest(manifestPath, tt.tc)
+			resultPath, err := d.patchManifest(context.Background(), manifestPath, tt.tc)
 			if err != nil {
 				t.Fatalf("patchManifest() returned error: %v", err)
 			}
@@ -397,7 +398,7 @@ spec:
 
 func TestPatchManifestReadError(t *testing.T) {
 	d := &Deployer{}
-	_, err := d.patchManifest("/nonexistent/path/manifest.yaml", &config.TestCase{
+	_, err := d.patchManifest(context.Background(), "/nonexistent/path/manifest.yaml", &config.TestCase{
 		Model: config.ModelConfig{URI: "hf://org/model", Name: "model"},
 	})
 	if err == nil {

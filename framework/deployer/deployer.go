@@ -29,8 +29,9 @@ type Deployer struct {
 	Platform    Platform
 	Namespace   string
 	ModelSource string // "pvc", "hf", or "pvc-snapshot"
-	MockImage      string // if set, replace vLLM image with mock and remove GPU resources
-	PullSecretName string // override pull secret name to copy (default: auto-detect from manifest)
+	MockImage      string   // if set, replace vLLM image with mock and remove GPU resources
+	PullSecretName string   // override pull secret name to copy (default: auto-detect from manifest)
+	DisableAuth    bool     // if true, inject security.opendatahub.io/enable-auth=false annotation
 	// LogFunc is called with progress messages. If nil, progress is silent.
 	LogFunc func(format string, args ...interface{})
 }
@@ -99,7 +100,7 @@ func (d *Deployer) Deploy(ctx context.Context, tc *config.TestCase) *DeployResul
 
 	// Patch the manifest with the correct model URI and name from test case config.
 	// This allows one manifest to work with both hf:// and pvc:// sources.
-	patchedPath, err := d.patchManifest(manifestPath, tc)
+	patchedPath, err := d.patchManifest(ctx, manifestPath, tc)
 	if err != nil {
 		result.Error = fmt.Errorf("patching manifest: %w", err)
 		result.Duration = time.Since(start)
@@ -553,6 +554,14 @@ func (d *Deployer) Kubectl(ctx context.Context, args ...string) (string, error) 
 	return d.runCommand(ctx, bin, cmdArgs...)
 }
 
+// supportsStorageInitializerField checks if the LLMInferenceService CRD has the
+// storageInitializer.enabled field (added in kserve/kserve#4970).
+func (d *Deployer) supportsStorageInitializerField(ctx context.Context) bool {
+	out, err := d.Kubectl(ctx, "get", "crd", "llminferenceservices.serving.kserve.io",
+		"-o", "jsonpath={.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.storageInitializer.properties.enabled.type}")
+	return err == nil && strings.TrimSpace(out) == "boolean"
+}
+
 func (d *Deployer) runCommand(ctx context.Context, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	output, err := cmd.CombinedOutput()
@@ -561,7 +570,7 @@ func (d *Deployer) runCommand(ctx context.Context, name string, args ...string) 
 
 // patchManifest reads a manifest, patches the model URI and name from the test case config,
 // and writes a temp file. This allows one manifest template to work with any model and source.
-func (d *Deployer) patchManifest(manifestPath string, tc *config.TestCase) (string, error) {
+func (d *Deployer) patchManifest(ctx context.Context, manifestPath string, tc *config.TestCase) (string, error) {
 	data, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return "", fmt.Errorf("reading manifest %s: %w", manifestPath, err)
@@ -569,6 +578,31 @@ func (d *Deployer) patchManifest(manifestPath string, tc *config.TestCase) (stri
 
 	lines := strings.Split(string(data), "\n")
 	patched := false
+
+	// Inject disable-auth annotation if requested
+	if d.DisableAuth {
+		inserted := false
+		for i, line := range lines {
+			if strings.TrimSpace(line) == "metadata:" {
+				// Check if annotations: already exists right after metadata:
+				if i+1 < len(lines) && strings.TrimSpace(lines[i+1]) == "annotations:" {
+					// Insert into existing annotations block
+					inject := "    security.opendatahub.io/enable-auth: \"false\""
+					lines = append(lines[:i+2], append([]string{inject}, lines[i+2:]...)...)
+				} else {
+					// Insert new annotations block
+					inject := []string{"  annotations:", "    security.opendatahub.io/enable-auth: \"false\""}
+					lines = append(lines[:i+1], append(inject, lines[i+1:]...)...)
+				}
+				patched = true
+				inserted = true
+				d.logProgress("  Injected disable-auth annotation")
+				break
+			}
+		}
+		_ = inserted
+	}
+
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		// Patch uri: line
@@ -609,6 +643,25 @@ func (d *Deployer) patchManifest(manifestPath string, tc *config.TestCase) (stri
 		}
 		if patched {
 			d.logProgress("  Patched imagePullSecrets to use %s", d.PullSecretName)
+		}
+	}
+
+	// Mock mode: disable storage-initializer if CRD supports it (avoids model download)
+	if d.MockImage != "" {
+		if d.supportsStorageInitializerField(ctx) {
+			// Inject storageInitializer.enabled: false after top-level "spec:" line
+			for i, line := range lines {
+				lineIndent := len(line) - len(strings.TrimLeft(line, " "))
+				if strings.TrimSpace(line) == "spec:" && lineIndent == 0 {
+					inject := []string{lines[i], "  storageInitializer:", "    enabled: false"}
+					lines = append(lines[:i+1], append(inject[1:], lines[i+1:]...)...)
+					patched = true
+					d.logProgress("  Mock mode: disabled storageInitializer (CRD supports it)")
+					break
+				}
+			}
+		} else {
+			d.logProgress("  Warning: CRD does not support storageInitializer.enabled — init container will still run (may fail on disconnected clusters)")
 		}
 	}
 

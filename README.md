@@ -170,6 +170,24 @@ This is useful for:
 - Testing framework changes without waiting for model downloads
 - Validating manifest structure and KServe operator behavior
 
+## Disconnected / Bare-Metal OCP Clusters
+
+For disconnected or bare-metal OpenShift clusters, additional setup is needed:
+- Gateway service must be patched to ClusterIP (LoadBalancer won't provision)
+- Mock image must be mirrored to the cluster's internal registry
+- A Route is required for external access from your laptop
+- Storage-initializer is automatically disabled in mock mode (no HuggingFace access needed)
+
+See [docs/disconnected-ocp-setup.md](docs/disconnected-ocp-setup.md) for full instructions.
+
+```bash
+# Quick start for disconnected OCP with mock mode
+make test TESTCASE=single-gpu \
+  MOCK=<bastion-host>:8443/models/vllm-mock:latest \
+  PLATFORM=ocp \
+  ENDPOINT=https://<route-hostname>
+```
+
 ## Configuration
 
 ### Flags
@@ -211,7 +229,8 @@ This is useful for:
 │   └── profiles/              # Named test profiles
 ├── .github/workflows/         # CI pipeline (lint, vet, build, smoke tests)
 ├── docs/
-│   └── adding-test-cases.md   # Guide for adding new test cases
+│   ├── adding-test-cases.md       # Guide for adding new test cases
+│   └── disconnected-ocp-setup.md  # Disconnected/bare-metal OCP setup
 └── reports/                   # JSON + HTML reports (generated)
 ```
 

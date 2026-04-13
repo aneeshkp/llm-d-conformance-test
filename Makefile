@@ -22,6 +22,8 @@ NO_CLEANUP ?=
 DISCOVER ?=
 MOCK ?=
 PULL_SECRET ?=
+BEARER_TOKEN ?=
+DISABLE_AUTH ?=
 
 # Build flags
 GO_TEST_FLAGS ?= -v
@@ -64,6 +66,12 @@ ifdef MOCK
 endif
 ifdef PULL_SECRET
   TEST_FLAGS += -pull-secret=$(PULL_SECRET)
+endif
+ifdef BEARER_TOKEN
+  TEST_FLAGS += -bearer-token=$(BEARER_TOKEN)
+endif
+ifdef DISABLE_AUTH
+  TEST_FLAGS += -disable-auth
 endif
 
 .PHONY: help
@@ -109,6 +117,24 @@ deps: ## Install Go dependencies
 .PHONY: build
 build: deps ## Build and verify compilation
 	$(GO) build ./...
+
+# ─── Mock vLLM Image ──────────────────────────────────────────────
+
+MOCK_IMAGE_REPO ?= quay.io/aneeshkp
+MOCK_IMAGE_NAME ?= vllm-mock
+MOCK_IMAGE_TAG ?= latest
+MOCK_IMAGE ?= $(MOCK_IMAGE_REPO)/$(MOCK_IMAGE_NAME):$(MOCK_IMAGE_TAG)
+
+.PHONY: mock-build
+mock-build: ## Build the mock vLLM image
+	podman build -t $(MOCK_IMAGE) test/mock-vllm/
+
+.PHONY: mock-push
+mock-push: ## Push the mock vLLM image to registry
+	podman push $(MOCK_IMAGE)
+
+.PHONY: mock-build-push
+mock-build-push: mock-build mock-push ## Build and push mock vLLM image
 
 # ─── Manifest Setup ─────────────────────────────────────────────
 
