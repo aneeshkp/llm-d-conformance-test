@@ -58,16 +58,7 @@ oc image mirror \
   -a /tmp/.dockerconfigjson
 ```
 
-## 4. RBAC for Bearer Token
-
-```bash
-# Grant access to your user
-kubectl create clusterrolebinding htpasswd-llmisvc-access \
-  --clusterrole=cluster-admin \
-  --user=<your-username>
-```
-
-## 5. Run Tests
+## 4. Run Tests
 
 ```bash
 make setup MANIFEST_REF=3.4-ea2
