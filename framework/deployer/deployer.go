@@ -79,9 +79,11 @@ func (d *Deployer) Deploy(ctx context.Context, tc *config.TestCase) *DeployResul
 	}
 	result.Logs = append(result.Logs, fmt.Sprintf("Namespace %s ready", ns))
 
-	// Copy image pull secrets referenced in the manifest from istio-system
+	// Copy image pull secrets referenced in the manifest into the target namespace
 	if err := d.ensurePullSecrets(ctx, tc.Deployment.ManifestPath, ns); err != nil {
-		d.logProgress("  Warning: failed to copy pull secrets: %v", err)
+		result.Error = fmt.Errorf("pull secret setup failed: %w", err)
+		result.Duration = time.Since(start)
+		return result
 	}
 
 	// Apply the manifest

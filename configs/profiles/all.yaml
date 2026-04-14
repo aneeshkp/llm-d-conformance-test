@@ -6,5 +6,6 @@ testCases:
   - single-gpu-no-scheduler
   - cache-aware
   - pd
+  - pd-cache-aware
 parallel: false
 timeout: 120m

@@ -220,6 +220,10 @@ test-profile-cache-aware: # Cache-aware routing
 test-profile-pd: # P/D disaggregation
 	$(MAKE) test-conformance PROFILE=configs/profiles/pd.yaml
 
+.PHONY: test-profile-pd-cache-aware
+test-profile-pd-cache-aware: # P/D + cache-aware hybrid
+	$(MAKE) test-conformance TESTCASE=pd-cache-aware
+
 .PHONY: test-profile-moe
 test-profile-moe: # MoE (8 GPUs + RDMA)
 	$(MAKE) test-conformance PROFILE=configs/profiles/deepseek.yaml
