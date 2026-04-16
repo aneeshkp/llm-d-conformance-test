@@ -590,6 +590,33 @@ var _ = Describe("LLM-D Conformance", func() {
 				if err != nil {
 					Fail(fmt.Sprintf("Service did not become ready: %v", err))
 				}
+
+				// For multi-pool: wait for all additional pools to become ready
+				if mp := tc.Validation.MultiPool; mp != nil && mp.Enabled {
+					primaryName := deployer.ExtractLLMISVCName(tc)
+					for _, pool := range mp.Pools {
+						if pool.Name == primaryName {
+							continue // already waited for the primary
+						}
+						logStep("[%s]   Waiting for additional pool: %s", tc.Name, pool.Name)
+						waitErr := retry.UntilSuccess(ctx, retry.Options{
+							Timeout:  tc.Deployment.ReadyTimeout.Duration,
+							Interval: 15 * time.Second,
+							Name:     fmt.Sprintf("wait-ready-%s", pool.Name),
+						}, func() error {
+							llmStatus, _ := dep.Kubectl(ctx, "get", "llmisvc", pool.Name, "-n", dep.Namespace, "-o",
+								"jsonpath={.status.conditions[?(@.type==\"Ready\")].status}")
+							if strings.EqualFold(strings.TrimSpace(llmStatus), "true") {
+								logStep("[%s]   ─── [%s] READY ───", tc.Name, pool.Name)
+								return nil
+							}
+							return fmt.Errorf("llmisvc %s not ready yet", pool.Name)
+						})
+						if waitErr != nil {
+							Fail(fmt.Sprintf("Multi-pool service %s did not become ready: %v", pool.Name, waitErr))
+						}
+					}
+				}
 				// Capture vLLM image and version (once per run)
 				vllmInfo := dep.GetVLLMVersion(ctx)
 				if img, ok := vllmInfo["vllmImage"]; ok {
@@ -830,6 +857,108 @@ var _ = Describe("LLM-D Conformance", func() {
 						logStep("[%s]   prompt[%d] PASSED via /v1/chat/completions (tokens=%d)", tc.Name, i, resp.Usage.TotalTokens)
 					}
 				}
+			})
+
+			// ── Phase 7b: MULTI-POOL ROUTING ─────────────────────
+			It("should route to each InferencePool independently", func() {
+				skipIfCache()
+				mp := tc.Validation.MultiPool
+				if mp == nil || !mp.Enabled || len(mp.Pools) == 0 {
+					Skip("multiPool validation not enabled")
+				}
+
+				logStep("[%s] Phase 7b: MULTI-POOL — Validating routing across %d pools", tc.Name, len(mp.Pools))
+
+				for i, pool := range mp.Pools {
+					logStep("[%s]   ── Testing route to pool: %s ──", tc.Name, pool.Name)
+
+					// Verify the LLMInferenceService exists and is ready
+					llmStatus, _ := dep.Kubectl(ctx, "get", "llmisvc", pool.Name, "-n", dep.Namespace, "-o",
+						"jsonpath={.status.conditions[?(@.type==\"Ready\")].status}")
+					if !strings.EqualFold(strings.TrimSpace(llmStatus), "true") {
+						Fail(fmt.Sprintf("pool %s: LLMInferenceService not ready (status=%s)", pool.Name, llmStatus))
+					}
+					logStep("[%s]   pool %s: LLMInferenceService Ready=True", tc.Name, pool.Name)
+
+					// Verify InferencePool exists
+					poolOut, _ := dep.Kubectl(ctx, "get", "inferencepool", "-n", dep.Namespace, "-l",
+						fmt.Sprintf("app.kubernetes.io/name=%s", pool.Name),
+						"-o", "jsonpath={.items[0].metadata.name}")
+					if strings.TrimSpace(poolOut) == "" {
+						Fail(fmt.Sprintf("pool %s: InferencePool not found", pool.Name))
+					}
+					logStep("[%s]   pool %s: InferencePool=%s", tc.Name, pool.Name, strings.TrimSpace(poolOut))
+
+					// Verify HTTPRoute exists and is accepted
+					routeStatus, _ := dep.Kubectl(ctx, "get", "httproute", "-n", dep.Namespace, "-l",
+						fmt.Sprintf("app.kubernetes.io/name=%s", pool.Name),
+						"-o", "jsonpath={.items[0].status.parents[0].conditions[?(@.type==\"Accepted\")].status}")
+					if !strings.EqualFold(strings.TrimSpace(routeStatus), "true") {
+						Fail(fmt.Sprintf("pool %s: HTTPRoute not accepted (status=%s)", pool.Name, routeStatus))
+					}
+					logStep("[%s]   pool %s: HTTPRoute Accepted=True", tc.Name, pool.Name)
+
+					// Get endpoint for this specific pool
+					poolURL, _ := dep.Kubectl(ctx, "get", "llmisvc", pool.Name, "-n", dep.Namespace,
+						"-o", "jsonpath={.status.url}")
+					poolEndpoint := strings.TrimSpace(poolURL)
+					if endpoint != "" {
+						poolEndpoint = fmt.Sprintf("%s/%s/%s", strings.TrimRight(endpoint, "/"), dep.Namespace, pool.Name)
+					}
+					if poolEndpoint == "" {
+						Fail(fmt.Sprintf("pool %s: no endpoint found", pool.Name))
+					}
+					logStep("[%s]   pool %s: endpoint=%s", tc.Name, pool.Name, poolEndpoint)
+
+					// Get model name from the pool's LLMInferenceService
+					poolModel, _ := dep.Kubectl(ctx, "get", "llmisvc", pool.Name, "-n", dep.Namespace,
+						"-o", "jsonpath={.spec.model.name}")
+					modelName := strings.TrimSpace(poolModel)
+					if modelName == "" {
+						modelName = tc.Model.Name
+					}
+
+					// Send inference request through this pool's route
+					poolClient := client.New(poolEndpoint)
+					poolClient.BearerToken = bearerToken
+
+					prompt := pool.Prompt
+					if prompt == "" {
+						prompt = "Hello"
+					}
+
+					logStep("[%s]   pool %s: sending inference request (model=%s, prompt=%q)", tc.Name, pool.Name, modelName, prompt)
+					err := retry.UntilSuccess(ctx, retry.Options{
+						Timeout:  tc.Validation.Timeout.Duration,
+						Interval: tc.Validation.RetryInterval.Duration,
+						Name:     fmt.Sprintf("multi-pool-inference-%s", pool.Name),
+					}, func() error {
+						resp, err := poolClient.ChatCompletions(ctx, client.ChatRequest{
+							Model: modelName,
+							Messages: []client.ChatMessage{
+								{Role: "user", Content: prompt},
+							},
+							MaxTokens: 50,
+						})
+						if err != nil {
+							return fmt.Errorf("inference failed: %w", err)
+						}
+						if len(resp.Choices) == 0 || resp.Choices[0].Message.Content == "" {
+							return fmt.Errorf("empty response")
+						}
+						logStep("[%s]   pool %s: PASSED (tokens=%d)", tc.Name, pool.Name, resp.Usage.TotalTokens)
+						return nil
+					})
+					if err != nil {
+						Fail(fmt.Sprintf("pool %s: inference routing failed: %v", pool.Name, err))
+					}
+
+					if i < len(mp.Pools)-1 {
+						logStep("[%s]   ── switching to next pool ──", tc.Name)
+					}
+				}
+
+				logStep("[%s]   All %d pools routed successfully — VirtualService merge verified", tc.Name, len(mp.Pools))
 			})
 
 			// ── Phase 8: METRICS — Scrape ─────────────────────────

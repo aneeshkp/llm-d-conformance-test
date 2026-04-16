@@ -106,7 +106,8 @@ type ValidateConfig struct {
 	Timeout        Duration      `yaml:"timeout"`
 	RetryAttempts  int           `yaml:"retryAttempts"`
 	RetryInterval  Duration      `yaml:"retryInterval"`
-	MetricsCheck   *MetricsCheck `yaml:"metricsCheck,omitempty"` // optional metrics validation
+	MetricsCheck   *MetricsCheck   `yaml:"metricsCheck,omitempty"`   // optional metrics validation
+	MultiPool      *MultiPoolCheck `yaml:"multiPool,omitempty"`      // multi-pool routing validation (OSSM-12585)
 }
 
 // ChatPrompt defines a structured prompt with system and user messages.
@@ -124,6 +125,19 @@ type MetricsCheck struct {
 	CheckPD          bool `yaml:"checkPD"`          // validate P/D token distribution
 	CheckScheduler   bool `yaml:"checkScheduler"`   // validate scheduler routing
 	CheckNIXL        bool `yaml:"checkNIXL"`        // validate NIXL KV transfers (experimental)
+}
+
+// MultiPoolCheck configures multi-pool routing validation.
+// Tests that multiple InferencePools can coexist and route correctly (OSSM-12585).
+type MultiPoolCheck struct {
+	Enabled bool       `yaml:"enabled"`
+	Pools   []PoolSpec `yaml:"pools"`
+}
+
+// PoolSpec defines a single InferencePool to validate in a multi-pool test.
+type PoolSpec struct {
+	Name   string `yaml:"name"`   // LLMInferenceService name (matches metadata.name in manifest)
+	Prompt string `yaml:"prompt"` // test prompt to send via this pool's route
 }
 
 // Duration wraps time.Duration for YAML unmarshalling.

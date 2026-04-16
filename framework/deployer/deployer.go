@@ -205,6 +205,19 @@ func (d *Deployer) WaitForReady(ctx context.Context, tc *config.TestCase) error 
 		d.logProgress("[%s] %s | svc=%s route=%s pool=%s pod=%s | %s/%s",
 			name, reason, svc, route, pool, podStatus, elapsed, remaining)
 
+		// Early fail: detect CrashLoopBackOff, ImagePullBackOff, ErrImagePull
+		crashOut, _ := d.Kubectl(ctx, "get", "pods", "-n", ns, "-l", label,
+			"-o", "jsonpath={range .items[*]}{range .status.containerStatuses[*]}{.state.waiting.reason}{\" \"}{end}{range .status.initContainerStatuses[*]}{.state.waiting.reason}{\" \"}{end}{end}")
+		for _, r := range strings.Fields(crashOut) {
+			switch r {
+			case "CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "CreateContainerError", "InvalidImageName":
+				// Get details for the error message
+				desc, _ := d.Kubectl(ctx, "get", "pods", "-n", ns, "-l", label,
+					"-o", "jsonpath={range .items[*]}{.metadata.name}: {range .status.containerStatuses[*]}{.name}={.state.waiting.reason}{\" \"}{end}{range .status.initContainerStatuses[*]}{.name}={.state.waiting.reason}{\" \"}{end}{\"\\n\"}{end}")
+				return fmt.Errorf("fatal pod error detected (%s): %s", r, strings.TrimSpace(desc))
+			}
+		}
+
 		// Call 3: Show last vLLM log line (only call that can't be combined)
 		vllmLog, _ := d.Kubectl(ctx, "logs", "-n", ns, "-l",
 			fmt.Sprintf("app.kubernetes.io/name=%s,app.kubernetes.io/component=llminferenceservice-workload", name),

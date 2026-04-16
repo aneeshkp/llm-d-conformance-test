@@ -300,11 +300,12 @@ testcases: ## List available test cases grouped by category
 	else \
 		printf '  \033[33mManifests: not cloned — run make setup\033[0m\n\n'; \
 	fi
-	@for category in single-node-gpu cache-aware multi-node-gpu deepseek; do \
+	@for category in single-node-gpu cache-aware multi-node-gpu multi-pool deepseek; do \
 		case $$category in \
 			single-node-gpu) header="Single-node GPU" ;; \
 			multi-node-gpu)  header="Multi-node GPU (P/D)" ;; \
 			cache-aware)     header="Cache-aware routing" ;; \
+			multi-pool)      header="Multi-pool routing (OSSM-12585)" ;; \
 			deepseek)        header="DeepSeek MoE (8+ GPUs)" ;; \
 		esac; \
 		printf '  \033[1m%s:\033[0m\n' "$$header"; \
