@@ -8,6 +8,10 @@
 # Test binary
 *.test
 
+# Coverage
+coverage.out
+coverage.html
+
 # Output
 reports/
 
