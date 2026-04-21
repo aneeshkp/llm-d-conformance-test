@@ -1,5 +1,7 @@
 # LLM-D Conformance Test Framework
 
+> **[Architecture Guide & Test Case Diagrams →](docs/architecture.md)** — Full framework overview, Mermaid diagrams for all 8 test topologies, deployment modes, metrics matrix, and more.
+
 Automated end-to-end conformance tests for [llm-d](https://github.com/llm-d) inference deployments on Kubernetes using the `LLMInferenceService` CRD.
 
 The test framework creates `LLMInferenceService` CRs on your cluster and validates the full lifecycle — the llm-d/KServe operator handles everything (vLLM image, pods, routing). Each test case is a proper Ginkgo spec with its own description and labels.
