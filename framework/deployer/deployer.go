@@ -34,6 +34,8 @@ type Deployer struct {
 	DisableAuth    bool     // if true, inject security.opendatahub.io/enable-auth=false annotation
 	// LogFunc is called with progress messages. If nil, progress is silent.
 	LogFunc func(format string, args ...interface{})
+	// kubectlFunc overrides Kubectl for testing. If nil, real kubectl is used.
+	kubectlFunc func(ctx context.Context, args ...string) (string, error)
 }
 
 // New creates a Deployer for the given platform and namespace.
@@ -497,61 +499,124 @@ func (d *Deployer) ensurePullSecrets(ctx context.Context, manifestPath, ns strin
 		}
 	}
 
-	sourceNamespaces := []string{"istio-system", "kserve", "opendatahub", "redhat-ods-applications"}
+	sourceNamespaces := []string{"istio-system", "kserve", "opendatahub", "redhat-ods-applications", "rhaii", "default", "redhat-ods-operator"}
+	// Pull secret name equivalence groups (EA1: redhat-pull-secret, EA2 chart: rhai-pull-secret,
+	// EA2 manifests: rhaii-pull-secret)
+	pullSecretGroups := [][]string{
+		{"rhaii-pull-secret", "rhai-pull-secret", "redhat-pull-secret"},
+	}
 	for secretName := range seen {
 		// Skip if already exists in target namespace
 		if _, err := d.Kubectl(ctx, "get", "secret", secretName, "-n", ns); err == nil {
 			continue
 		}
 
-		// Try to copy from known source namespaces
-		copied := false
-		for _, srcNS := range sourceNamespaces {
-			if _, err := d.Kubectl(ctx, "get", "secret", secretName, "-n", srcNS); err != nil {
-				continue
-			}
-			// Get the secret and re-apply in target namespace
-			secretYAML, err := d.Kubectl(ctx, "get", "secret", secretName, "-n", srcNS, "-o", "yaml")
-			if err != nil {
-				continue
-			}
-			// Replace namespace and strip cluster-specific metadata
-			secretYAML = strings.ReplaceAll(secretYAML, "namespace: "+srcNS, "namespace: "+ns)
-			// Remove resourceVersion, uid, creationTimestamp so it can be created fresh
-			var cleanLines []string
-			for _, l := range strings.Split(secretYAML, "\n") {
-				t := strings.TrimSpace(l)
-				if strings.HasPrefix(t, "resourceVersion:") ||
-					strings.HasPrefix(t, "uid:") ||
-					strings.HasPrefix(t, "creationTimestamp:") {
-					continue
+		// Build list of names to try: exact name first, then equivalence group aliases
+		namesToTry := []string{secretName}
+		for _, group := range pullSecretGroups {
+			for _, name := range group {
+				if name == secretName {
+					for _, alias := range group {
+						if alias != secretName {
+							namesToTry = append(namesToTry, alias)
+						}
+					}
+					break
 				}
-				cleanLines = append(cleanLines, l)
 			}
-			tmpFile, err := os.CreateTemp("", "pull-secret-*.yaml")
-			if err != nil {
-				return fmt.Errorf("creating temp file: %w", err)
-			}
-			_, _ = tmpFile.WriteString(strings.Join(cleanLines, "\n"))
-			_ = tmpFile.Close()
-			_, err = d.Kubectl(ctx, "apply", "-n", ns, "-f", tmpFile.Name())
-			_ = os.Remove(tmpFile.Name())
-			if err != nil {
-				continue
-			}
-			d.logProgress("  Copied pull secret %s from %s to %s", secretName, srcNS, ns)
-			copied = true
-			break
 		}
-		if !copied {
-			return fmt.Errorf("pull secret %q not found in any of %v", secretName, sourceNamespaces)
+
+		// Try to copy from known source namespaces
+		srcName, srcNS, err := d.findSecret(ctx, namesToTry, sourceNamespaces)
+		if err != nil {
+			d.logProgress("  WARNING: pull secret %q not found in any of %v (tried names: %v) — skipping, deploy may fail if secret is required", secretName, sourceNamespaces, namesToTry)
+			continue
+		}
+		if err := d.copySecret(ctx, srcName, srcNS, secretName, ns); err != nil {
+			return fmt.Errorf("copying pull secret %q from %s/%s: %w", secretName, srcNS, srcName, err)
+		}
+		if srcName != secretName {
+			d.logProgress("  Copied pull secret %s (from %s) %s -> %s", secretName, srcName, srcNS, ns)
+		} else {
+			d.logProgress("  Copied pull secret %s from %s to %s", secretName, srcNS, ns)
 		}
 	}
 	return nil
 }
 
+// findSecret searches for a secret by trying each name in each namespace.
+// Returns the found name, namespace, or an error if not found.
+func (d *Deployer) findSecret(ctx context.Context, names []string, namespaces []string) (string, string, error) {
+	for _, name := range names {
+		for _, ns := range namespaces {
+			if _, err := d.Kubectl(ctx, "get", "secret", name, "-n", ns); err == nil {
+				return name, ns, nil
+			}
+		}
+	}
+	return "", "", fmt.Errorf("not found")
+}
+
+// copySecret copies a secret from one namespace to another, optionally renaming it.
+// It strips cluster-specific metadata (resourceVersion, uid, creationTimestamp).
+func (d *Deployer) copySecret(ctx context.Context, srcName, srcNS, destName, destNS string) error {
+	secretYAML, err := d.Kubectl(ctx, "get", "secret", srcName, "-n", srcNS, "-o", "yaml")
+	if err != nil {
+		return err
+	}
+
+	// Strip cluster-specific metadata and update namespace/name.
+	// Only rename name/namespace fields that are direct children of metadata:
+	// (indented exactly one level, typically "  name: ...").
+	var cleanLines []string
+	inMetadata := false
+	metadataIndent := ""
+	for _, l := range strings.Split(secretYAML, "\n") {
+		t := strings.TrimSpace(l)
+		// Track metadata block (top-level key with no indentation)
+		if len(l) > 0 && l[0] != ' ' && l[0] != '\t' && strings.HasSuffix(t, ":") {
+			inMetadata = t == "metadata:"
+			metadataIndent = ""
+		}
+		// Detect the indent of direct children under metadata:
+		if inMetadata && metadataIndent == "" && t != "metadata:" && t != "" {
+			metadataIndent = l[:len(l)-len(strings.TrimLeft(l, " \t"))]
+		}
+		// Check if this line is a direct child of metadata (same indent as first child)
+		isMetadataChild := inMetadata && metadataIndent != "" &&
+			strings.HasPrefix(l, metadataIndent) &&
+			(len(l) == len(metadataIndent)+len(t)) // no deeper indentation
+		switch {
+		case strings.HasPrefix(t, "resourceVersion:"),
+			strings.HasPrefix(t, "uid:"),
+			strings.HasPrefix(t, "creationTimestamp:"):
+			continue
+		case isMetadataChild && t == "namespace: "+srcNS:
+			cleanLines = append(cleanLines, strings.Replace(l, srcNS, destNS, 1))
+		case isMetadataChild && srcName != destName && t == "name: "+srcName:
+			cleanLines = append(cleanLines, strings.Replace(l, srcName, destName, 1))
+		default:
+			cleanLines = append(cleanLines, l)
+		}
+	}
+
+	tmpFile, err := os.CreateTemp("", "pull-secret-*.yaml")
+	if err != nil {
+		return fmt.Errorf("creating temp file: %w", err)
+	}
+	defer func() { _ = os.Remove(tmpFile.Name()) }()
+	_, _ = tmpFile.WriteString(strings.Join(cleanLines, "\n"))
+	_ = tmpFile.Close()
+
+	_, err = d.Kubectl(ctx, "apply", "-n", destNS, "-f", tmpFile.Name())
+	return err
+}
+
 // Kubectl runs a kubectl command with the deployer's kubeconfig and platform settings.
 func (d *Deployer) Kubectl(ctx context.Context, args ...string) (string, error) {
+	if d.kubectlFunc != nil {
+		return d.kubectlFunc(ctx, args...)
+	}
 	cmdArgs := make([]string, 0, len(args)+2)
 	if d.Kubeconfig != "" {
 		cmdArgs = append(cmdArgs, "--kubeconfig", d.Kubeconfig)

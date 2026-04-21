@@ -87,8 +87,10 @@ help: ## Show this help
 	@printf '  \033[33m%-25s\033[0m %s\n' "" "make test TESTCASE=single-gpu MODEL=Qwen/Qwen2.5-7B-Instruct"
 	@printf '  \033[36m%-25s\033[0m %s\n' "MODEL_SOURCE" "Model source: hf (default) or pvc (pre-cached)"
 	@printf '  \033[33m%-25s\033[0m %s\n' "" "make test TESTCASE=single-gpu MODEL_SOURCE=pvc"
-	@printf '  \033[36m%-25s\033[0m %s\n' "MANIFEST_REF" "Manifest repo branch (default: main)"
-	@printf '  \033[33m%-25s\033[0m %s\n' "" "make setup MANIFEST_REF=3.4-ea1"
+	@printf '  \033[36m%-25s\033[0m %s\n' "MANIFEST_REF" "Manifest repo branch (default: main). See: make manifests"
+	@printf '  \033[33m%-25s\033[0m %s\n' "" "make setup MANIFEST_REF=3.4-stable  # latest stable"
+	@printf '  \033[33m%-25s\033[0m %s\n' "" "make setup MANIFEST_REF=3.4-ea2     # EA2 branch"
+	@printf '  \033[33m%-25s\033[0m %s\n' "" "make setup MANIFEST_REF=3.4-ea1     # EA1 branch"
 	@printf '  \033[36m%-25s\033[0m %s\n' "MANIFEST_REPO" "Manifest repo URL"
 	@printf '  \033[33m%-25s\033[0m %s\n' "" "make setup MANIFEST_REPO=https://github.com/myorg/manifests.git"
 	@printf '  \033[36m%-25s\033[0m %s\n' "NO_CLEANUP" "Keep resources after test for debugging"
@@ -174,6 +176,49 @@ endif
 delete-manifests: ## Remove cloned manifests
 	@rm -rf $(MANIFEST_DIR)
 	@echo "Manifests removed. Run 'make setup' to re-clone."
+
+.PHONY: manifests
+manifests: ## List available manifest branches and local manifest files
+	@echo ""
+	@printf '  \033[1mManifest repo:\033[0m %s\n' "$(MANIFEST_REPO)"
+	@echo ""
+	@printf '  \033[1mAvailable branches:\033[0m\n'
+	@git ls-remote --heads $(MANIFEST_REPO) 2>/dev/null | awk -F'refs/heads/' '{print $$2}' | sort | while read branch; do \
+		case "$$branch" in \
+			main|3.4-stable) printf '    \033[32m%-20s\033[0m (recommended)\n' "$$branch" ;; \
+			*) printf '    \033[36m%-20s\033[0m\n' "$$branch" ;; \
+		esac; \
+	done
+	@echo ""
+	@if [ -d "$(MANIFEST_DIR)" ]; then \
+		printf '  \033[1mCloned:\033[0m %s\n' "$$(cat $(MANIFEST_DIR)/version.txt 2>/dev/null | paste -sd ' ' -)"; \
+		echo ""; \
+		printf '  \033[1mManifest files:\033[0m\n'; \
+		for f in $(MANIFEST_DIR)/*.yaml; do \
+			name=$$(basename $$f .yaml); \
+			tc="configs/testcases/$$name.yaml"; \
+			if [ -f "$$tc" ]; then \
+				printf '    \033[36m%-30s\033[0m test case: \033[32myes\033[0m\n' "$$name.yaml"; \
+			else \
+				printf '    \033[36m%-30s\033[0m test case: \033[33mmissing\033[0m\n' "$$name.yaml"; \
+			fi; \
+		done; \
+	else \
+		printf '  \033[33mNo manifests cloned. Run: make setup [MANIFEST_REF=<branch>]\033[0m\n'; \
+	fi
+	@echo ""
+	@echo "Usage:"
+	@echo "  make setup                          # clone main (latest stable)"
+	@echo "  make setup MANIFEST_REF=3.4-stable  # clone 3.4-stable branch"
+	@echo "  make setup MANIFEST_REF=3.4-ea2     # clone EA2 branch"
+	@echo ""
+
+.PHONY: unittest
+unittest: ## Run unit tests with coverage
+	$(GO) test ./framework/... -v -count=1 -coverprofile=coverage.out
+	$(GO) tool cover -func=coverage.out
+	@echo ""
+	@echo "HTML report: go tool cover -html=coverage.out -o coverage.html"
 
 .PHONY: lint
 lint: ## Run golangci-lint and go vet
